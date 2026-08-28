@@ -1,6 +1,7 @@
 """Conversation store — manages conversations and their items."""
 
 import hashlib
+import math
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -285,6 +286,26 @@ class NameAlreadyExistsError(Exception):
     """
 
 
+def _is_addable_usage_increment(value: Any) -> bool:
+    """
+    Return whether *value* is a safe additive ``session_usage`` increment.
+
+    Every production caller (the relay ``_accumulate_session_usage`` path)
+    only ever adds a finite, non-negative count or cost. A negative or
+    non-finite increment is therefore corruption — applied additively it
+    would drive a cumulative counter backwards or poison it with ``NaN`` /
+    ``inf``, and the relay cost-budget gate reads these very totals — so
+    :func:`apply_session_usage_delta` drops it rather than merging it.
+
+    :param value: A flat or ``by_model`` sub-key increment from a delta.
+    :returns: ``True`` when *value* is a finite, non-negative, non-bool
+        number; ``False`` otherwise.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
 def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) -> None:
     """
     Apply a usage *delta* to *current* in place (add semantics, nested-aware).
@@ -293,6 +314,11 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
     model id, summing each model's sub-keys independently. Used by
     :meth:`ConversationStore.increment_session_usage` implementations to
     keep the merge logic in one place.
+
+    Negative and non-finite increments are dropped (see
+    :func:`_is_addable_usage_increment`): they can only come from a forged
+    runner usage frame and would corrupt the cumulative totals the relay
+    cost-budget gate enforces on.
 
     :param current: Existing ``session_usage`` dict (mutated in place).
     :param delta: Increments to apply (same layout as ``session_usage``).
@@ -303,8 +329,10 @@ def apply_session_usage_delta(current: dict[str, Any], delta: dict[str, Any]) ->
             for model_id, model_delta in value.items():
                 bucket = by_model.setdefault(model_id, {})
                 for sub_key, sub_value in model_delta.items():
+                    if not _is_addable_usage_increment(sub_value):
+                        continue
                     bucket[sub_key] = bucket.get(sub_key, 0) + sub_value
-        else:
+        elif _is_addable_usage_increment(value):
             current[key] = current.get(key, 0) + value
 
 
@@ -776,6 +804,7 @@ class ConversationStore(ABC):
         _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
+        reported_model: str | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
@@ -785,7 +814,9 @@ class ConversationStore(ABC):
         and ``harness_override``,
         ``None`` means "leave unchanged". To explicitly clear them
         back to ``None``, pass
-        the matching ``_unset_*`` flag.
+        the matching ``_unset_*`` flag. ``reported_model`` (the model
+        the harness last reported, verbatim) has no ``_unset`` variant:
+        reports only ever move forward.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1654,6 +1685,35 @@ class ConversationStore(ABC):
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.
+        """
+        ...
+
+    @abstractmethod
+    def has_other_live_session_in_workspace(
+        self,
+        *,
+        host_id: str,
+        workspace: str,
+        exclude_conversation_id: str,
+    ) -> bool:
+        """
+        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+
+        Sessions routinely share one directory: a fork reusing the source's
+        worktree, or several sessions attached to the same existing worktree
+        via the picker. Worktree cleanup must not remove a directory a live
+        session still runs in, so this is the "is it in use?" gate.
+
+        Archived sessions do not count. They run nothing, so removing the
+        directory cannot wedge them, and counting them would mean a worktree
+        shared by two forks is never cleaned up once either is archived.
+
+        :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
+        :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
+        :param exclude_conversation_id: The conversation being deleted or
+            archived — its own row must not count as "another session".
+        :returns: ``True`` when at least one other live conversation
+            references the pair, else ``False``.
         """
         ...
 

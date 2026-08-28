@@ -18,13 +18,205 @@
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
+const fs = require("node:fs");
+const os = require("node:os");
+const { createRequire } = require("node:module");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
+const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+function loadNavigationHarness({
+  serverUrl = "https://host.example/ml/omnigents",
+  registerFallbacks = true,
+} = {}) {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  const listeners = new Map();
+  const calls = { loadFile: [] };
+  const appEvents = new Map();
+  const webContents = {
+    on(eventName, listener) {
+      listeners.set(eventName, listener);
+    },
+    emit(eventName, ...args) {
+      listeners.get(eventName)?.({}, ...args);
+    },
+    getURL: () => serverUrl,
+    setWindowOpenHandler: () => {},
+  };
+  const win = {
+    webContents,
+    contentView: { addChildView: () => {}, removeChildView: () => {} },
+    isDestroyed: () => false,
+    isMaximized: () => false,
+    getNormalBounds: () => ({ x: 0, y: 0, width: 1280, height: 860 }),
+    getPosition: () => [0, 0],
+    setPosition: () => {},
+    maximize: () => {},
+    on: () => {},
+    loadFile: (...args) => {
+      calls.loadFile.push(args);
+      return Promise.resolve();
+    },
+    loadURL: () => Promise.resolve(),
+  };
+
+  function createDesktopUpdater() {
+    return {
+      init() {},
+      registerIpc() {},
+      getConfig: () => ({ mode: "none", autoInstall: false, skippedVersion: null }),
+      getStatus: () => ({ state: "idle" }),
+      checkForUpdates: async () => {},
+      installUpdateNow: () => false,
+      quitAndInstallIfPending: () => false,
+    };
+  }
+
+  const electron = {
+    app: {
+      isPackaged: false,
+      getPath: () => userData,
+      setName: () => {},
+      setBadgeCount: () => true,
+      requestSingleInstanceLock: () => true,
+      on: (eventName, listener) => appEvents.set(eventName, listener),
+      whenReady: () => ({ then: () => {} }),
+      quit: () => {},
+      exit: () => {},
+      isReady: () => false,
+      setAsDefaultProtocolClient: () => {},
+      setAppUserModelId: () => {},
+      getVersion: () => "test",
+    },
+    BrowserWindow: Object.assign(
+      function BrowserWindow() {
+        return win;
+      },
+      {
+        fromWebContents: () => null,
+        getFocusedWindow: () => null,
+        getAllWindows: () => [],
+      },
+    ),
+    WebContentsView: function WebContentsView() {},
+    Menu: { buildFromTemplate: () => ({}), setApplicationMenu: () => {} },
+    Notification: { isSupported: () => false },
+    clipboard: { writeText: () => {} },
+    dialog: {},
+    ipcMain: { handle: () => {}, on: () => {} },
+    nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
+    nativeTheme: { shouldUseDarkColors: false, on: () => {} },
+    screen: {},
+    session: { defaultSession: {} },
+    shell: {},
+    systemPreferences: {},
+  };
+
+  const localRequires = {
+    "./desktop_updater": { createDesktopUpdater },
+    "./update_overlay": {
+      createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
+    },
+    "./localhost_cors": { registerLocalhostCors: () => {} },
+    "./url": {
+      normalizeUrl: (url) => url,
+      expandDatabricksWorkspaceUrl: async (url) => url,
+      fetchServerManifest: async () => ({}),
+      PRE_MANIFEST_BASELINE: {},
+    },
+    "./deepLink": {
+      parseOmnigentDeepLink: () => null,
+      chooseDeepLinkStrategy: () => null,
+    },
+    "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./browserViewRegistry": {
+      createBrowserViewRegistry: () => ({ closeAll: () => {} }),
+    },
+    "./browserViewBounds": {
+      createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
+    },
+    "./browserIpc": { registerBrowserIpc: () => {} },
+    "./session-expiry": { registerSessionExpiryReload: () => {} },
+    "./popupPolicy": {
+      decideWindowOpen: () => ({ kind: "ignore" }),
+      stripCrossOriginOpenerHeaders: () => {},
+      WEB_SCHEMES: new Set(),
+    },
+    "./omnigent_cli": {
+      isExecutableFile: () => false,
+      resolveCliPath: () => null,
+      localHostId: () => "host_test",
+      getCliStatus: () => ({ installed: false }),
+    },
+    "./server_manager": {
+      shutdown: async () => {},
+      onChange: () => {},
+      ensureServerAuth: async () => ({ ok: true }),
+      ensureHostConnected: async () => ({ ok: true }),
+      restartHost: async () => ({ ok: true }),
+      disconnectHost: async () => ({ ok: true }),
+      startLocalServer: async () => ({ ok: false }),
+    },
+  };
+
+  const mainPath = path.join(__dirname, "../src/main.js");
+  const mainRequire = createRequire(mainPath);
+  const source =
+    fs.readFileSync(mainPath, "utf8") +
+    "\nmodule.exports.testApi = { createWindow, registerNavigationFallbacks, windows, SETUP_PAGE };";
+  const module = { exports: {} };
+  const sandbox = {
+    __dirname: path.dirname(mainPath),
+    __filename: mainPath,
+    AbortController,
+    AbortSignal,
+    Buffer,
+    URL,
+    URLSearchParams,
+    clearInterval,
+    clearTimeout,
+    console,
+    module,
+    process: { ...process, env: { ...process.env } },
+    require: (specifier) => {
+      if (specifier === "electron") return electron;
+      if (specifier === "electron-updater") return { autoUpdater: {} };
+      if (specifier in localRequires) return localRequires[specifier];
+      return mainRequire(specifier);
+    },
+    setInterval,
+    setTimeout,
+  };
+
+  vm.runInNewContext(source, sandbox, { filename: mainPath });
+  const api = module.exports.testApi;
+  api.windows.set(win, {
+    origin: new URL(serverUrl).origin,
+    serverUrl,
+    ephemeral: false,
+    badgeCount: 0,
+    browserRegistry: { closeAll: () => {} },
+  });
+  if (registerFallbacks) api.registerNavigationFallbacks(win);
+
+  return {
+    api,
+    calls,
+    emit: (eventName, ...args) => webContents.emit(eventName, ...args),
+    hasListener: (eventName) => listeners.has(eventName),
+    win,
+    cleanup: () => {
+      api.windows.clear();
+      fs.rmSync(userData, { recursive: true, force: true });
+    },
+  };
+}
 
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
@@ -38,6 +230,60 @@ describe("setup clipboard IPC wiring", () => {
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
+    );
+  });
+});
+
+describe("managed server preference wiring", () => {
+  it("exposes managed servers only through the setup-page bridge", () => {
+    assert.match(
+      preloadSource,
+      /getManagedServers:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("omnigent:get-managed-servers"\)/,
+    );
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-managed-servers"[\s\S]{0,180}!isSetupPageSender\(event\)[\s\S]{0,180}return managedServerUrls\(\)/,
+    );
+  });
+
+  it("preserves a managed path while still expanding bare workspace roots", () => {
+    assert.match(
+      liveCode,
+      /managedTarget\s*\?\?\s*normalizeUrl\(url\)[\s\S]{0,120}await expandDatabricksWorkspaceUrl\(normalized\)/,
+    );
+  });
+
+  it("returns managed choices in the connected-server picker", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,500}managedServers[\s\S]{0,100}recentServers:\s*recents/,
+    );
+  });
+
+  it("allows switching only to a recent or currently managed target", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:switch-server"[\s\S]{0,500}knownRecent[\s\S]{0,200}managedServerUrls\(\)\.includes\(url\)[\s\S]{0,150}!knownRecent\s*&&\s*!knownManaged/,
+    );
+  });
+
+  it("renders organization-provided servers separately on setup", () => {
+    assert.match(setupSource, /Provided by your organization/);
+    assert.match(setupSource, /setup\s*\.getManagedServers\(\)/);
+  });
+});
+
+describe("production developer-mode wiring (src/main.js)", () => {
+  it("uses the same opt-in to enable the shell window's DevTools capability", () => {
+    assert.match(liveCode, /webPreferences:\s*\{[\s\S]{0,400}devTools:\s*developerModeEnabled\(\)/);
+  });
+});
+
+describe("workspace root bounce wiring (src/main.js)", () => {
+  it("registers the bounce against the window's current pinned origin", () => {
+    assert.match(
+      liveCode,
+      /registerWorkspaceRootBounce\(\s*win\.webContents,\s*\(\)\s*=>\s*pinnedOrigin\(win\)\s*\)/,
     );
   });
 });
@@ -70,6 +316,22 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
         "injecting on every load is a safe no-op elsewhere. See src/workspace-chrome.js.",
       ].join(" "),
     );
+  });
+});
+
+describe("navigation fallback wiring (src/main.js)", () => {
+  it("registers navigation fallbacks when createWindow builds a window", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+
+    const win = harness.api.createWindow("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Unavailable");
+
+    assert.equal(win, harness.win);
+    assert.equal(harness.hasListener("did-fail-load"), true);
+    assert.equal(harness.hasListener("did-navigate"), true);
+    assert.equal(harness.calls.loadFile.length, 1);
+    assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
+    harness.cleanup();
   });
 });
 
@@ -174,8 +436,31 @@ describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
   });
 });
 
+describe("recent-server startup wiring (src/main.js)", () => {
+  it("backfills a saved server only after its cold load succeeds", () => {
+    assert.match(
+      liveCode,
+      /loadURL\(destination\)\s*\.then\(\(\)\s*=>\s*\{\s*if\s*\(!ephemeral\s*&&\s*!explicit\s*&&\s*serverUrl\)[\s\S]{0,200}rememberRecentServer\(settings,\s*serverUrl\)/,
+      [
+        "createWindow no longer backfills a successfully loaded saved server into",
+        "recent_servers. Existing installs can have server_url without recent_servers,",
+        "so the setup page would show no recents after leaving that server. Keep the",
+        "backfill in loadURL(destination).then, gated away from ephemeral windows and",
+        "explicit target URLs (which may include a conversation path).",
+      ].join(" "),
+    );
+  });
+
+  it("normalizes persisted targets and excludes managed origins from setup recents", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,400}excludingManagedServers\(\s*normalizeRecentServers\(loadSettings\(\)\.recent_servers\),\s*managed/,
+    );
+  });
+});
+
 // Guard for the deep-link path join in createWindow. A basename-less SPA path
-// (/c/<id>) lives UNDER the server's workspace mount (/ml/omnigents), so it
+// (/c/<id>) lives UNDER the server's workspace mount (/omnigent), so it
 // must be string-concatenated (resolveServerPath) — NOT resolved with
 // `new URL(path, serverUrl)`, which would anchor against the ORIGIN and drop
 // the mount, opening the wrong URL for every workspace deep link. This catches
@@ -187,7 +472,7 @@ describe("deep-link path join wiring (src/main.js)", () => {
       /resolveServerPath\(serverUrl, opts\.path\)/,
       [
         "createWindow no longer joins opts.path onto opts.serverUrl via",
-        "resolveServerPath. A deep link to a workspace server (origin + /ml/omnigents",
+        "resolveServerPath. A deep link to a workspace server (origin + /omnigent",
         "mount) would lose the mount and 404. Restore the mount-aware join (see",
         "resolveServerPath); do not replace it with `new URL(path, serverUrl)`.",
       ].join(" "),
@@ -342,6 +627,80 @@ describe("deep-link ingestion wiring (src/main.js)", () => {
         "confirmOpenDeepLink (in the consent-unknown branch), not before chooseDeepLinkStrategy.",
       ].join(" "),
     );
+  });
+});
+
+// HTTP 4xx/5xx commits as a successful Chromium navigation (empty body → black
+// window against backgroundColor), so did-fail-load never fires. did-navigate
+// carries httpResponseCode for main-frame navigations — fall back to setup
+// with ?error=&url= the same way the net-error path does.
+describe("HTTP error status fallback (src/main.js)", () => {
+  it("routes a 404 to the setup error surface with the mounted server URL", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    harness.emit("did-navigate", "https://host.example/ml/omnigents/health", 404, "Not Found");
+
+    assert.equal(harness.calls.loadFile.length, 1);
+    assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
+    const params = new URLSearchParams(harness.calls.loadFile[0][1].search);
+    assert.equal(params.get("error"), "404 Not Found");
+    assert.equal(params.get("url"), "https://host.example/ml/omnigents");
+  });
+
+  it("routes a 503 to the same setup error surface", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    harness.emit("did-navigate", "https://host.example/ml/omnigents/", 503, "Service Unavailable");
+
+    assert.equal(harness.calls.loadFile.length, 1);
+    const params = new URLSearchParams(harness.calls.loadFile[0][1].search);
+    assert.equal(params.get("error"), "503 Service Unavailable");
+    assert.equal(params.get("url"), "https://host.example/ml/omnigents");
+  });
+
+  it("does not fall back for successful or redirect navigations", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    harness.emit("did-navigate", "https://host.example/ml/omnigents/", 200, "OK");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents/login", 302, "Found");
+
+    assert.deepEqual(harness.calls.loadFile, []);
+  });
+
+  it("ignores a duplicate failure after the first fallback unpins the window", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    const failedUrl = "https://host.example/ml/omnigents/health";
+    harness.emit("did-navigate", failedUrl, 503, "Service Unavailable");
+
+    assert.equal(harness.api.windows.get(harness.win).origin, null);
+    // Unpinning makes the origin guard reject re-entry.
+    harness.emit("did-navigate", failedUrl, 503, "Service Unavailable");
+
+    assert.equal(harness.calls.loadFile.length, 1);
+  });
+
+  it("keeps the network-error fallback and ignores ERR_ABORTED", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    harness.emit(
+      "did-fail-load",
+      -105,
+      "NAME_NOT_RESOLVED",
+      "https://host.example/ml/omnigents/",
+      true,
+    );
+    assert.equal(harness.calls.loadFile.length, 1);
+
+    const aborted = loadNavigationHarness();
+    t.after(aborted.cleanup);
+    aborted.emit("did-fail-load", -3, "ABORTED", "https://host.example/ml/omnigents/", true);
+    assert.deepEqual(aborted.calls.loadFile, []);
   });
 });
 

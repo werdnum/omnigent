@@ -115,6 +115,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -676,9 +679,10 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
-function mockHosts(hosts: Host[]) {
+function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
+    ...queryState,
   } as unknown as ReturnType<typeof useHosts>);
 }
 
@@ -966,6 +970,46 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
+  it("does not replace a missing remembered host with the first cached host", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    // The shared query cache can render an older host list first while a
+    // background refresh is already fetching the continuously-live VM.
+    mockHosts([host("online", 1)], { isFetching: true });
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveTextContent("Choose host"));
+
+    // Model the fresh /v1/hosts response. Because the stale Mac never filled
+    // selectedHostId, the remembered VM can still win when it appears.
+    mockHosts([host("online", 1), host("online", 2)], { isFetching: false });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rerender" },
+    });
+
+    await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
+  });
+
+  it("does not silently replace an unavailable remembered host", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
+  it("does not replace an unavailable remembered host with the managed sandbox", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
@@ -982,11 +1026,18 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "block",
       "min-h-[60px]",
       "max-h-[200px]",
+      "overflow-y-auto",
       "px-4",
       "pt-3",
       "pb-2",
+      "[scrollbar-width:none]",
+      "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+      "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
@@ -1518,9 +1569,9 @@ describe("NewChatLandingScreen", () => {
 
     openAgentConfig("a2");
     openSelect("new-chat-landing-config-model");
-    expect(screen.getAllByText("Default (databricks-gpt-5-5)").length).toBeGreaterThan(0);
-    expect(screen.getByText("databricks-gpt-5-6")).toBeTruthy();
-    fireEvent.click(screen.getByText("databricks-gpt-5-6"));
+    expect(screen.getAllByText("Default (GPT-5.5)").length).toBeGreaterThan(0);
+    expect(screen.getByText("GPT-5.6")).toBeTruthy();
+    fireEvent.click(screen.getByText("GPT-5.6"));
     saveConfig();
 
     // The Codex model is remembered under codex-native only; Claude Code's
@@ -1528,14 +1579,12 @@ describe("NewChatLandingScreen", () => {
     openAgentConfig("a1");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).not.toContain(
-      "databricks-gpt-5-6",
+      "GPT-5.6",
     );
     saveConfig();
 
     openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "databricks-gpt-5-6",
-    );
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("GPT-5.6");
     saveConfig();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "run the build" },
@@ -1547,6 +1596,28 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("reports start-session telemetry when a create is triggered with the Enter key", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    // Enter creates the session without going through the Start button, so the
+    // telemetry has to fire from handleCreate — not the Button's componentId.
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "new_chat.start_session",
+      componentKind: "button",
+    });
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
@@ -2476,6 +2547,46 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("clears a drafted sandbox repository when remounting under another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
+    // away (unmount parks them in the module-scoped landing draft).
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    // Unmount WITHOUT resetting the draft — the leak under test rides in it.
+    cleanup();
+
+    // Project Beta's composer: the repo inputs compose the managed create's
+    // workspace string, so Alpha's repo/branch must not survive — otherwise
+    // Beta's sandbox silently clones another project's repository.
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start fresh" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace (empty server-created
+    // one) — not Alpha's repo#branch.
+    expect(body.workspace).toBeUndefined();
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -2747,6 +2858,17 @@ describe("NewChatLandingScreen skill pills", () => {
     // fed from GET /v1/agents bundled skills.
     expect(screen.getByTestId("skill-pill-debate").textContent).toBe("/debate");
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
+  });
+
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
   });
 
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
@@ -3212,9 +3334,10 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
     expect(screen.queryByTestId("new-chat-landing-config-modal")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Reopened: Plan was discarded, the permission select is back at Default.
+    // Reopened: Plan was discarded, the permission select is back at Manual
+    // (Claude's label for the prompting `default` mode).
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 
@@ -3474,7 +3597,7 @@ describe("NewChatLandingScreen smart routing", () => {
   it.each([
     ["Claude Code", "a1", true, "Smart Routing", "Opus 4.8"],
     ["Claude Code", "a1", false, null, "Default"],
-    ["Codex", "a2", true, "Smart Routing", "Default (databricks-gpt-5-5)"],
+    ["Codex", "a2", true, "Smart Routing", "Default (GPT-5.5)"],
   ] as const)(
     "%s Model dropdown with the flag %s offers %s alongside %s",
     (_label, agentId, flag, routingOption, siblingOption) => {
@@ -3541,7 +3664,7 @@ describe("NewChatLandingScreen smart routing", () => {
         expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
         expect(
           screen.getByRole("option", {
-            name: agentId === "a2" ? "databricks-gpt-5-6" : "Opus 4.8",
+            name: agentId === "a2" ? "GPT-5.6" : "Opus 4.8",
           }),
         ).toBeTruthy();
       }
@@ -4271,7 +4394,7 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
     selectAgent("a1");
     fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
     expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
-      "Default",
+      "Manual",
     );
   });
 

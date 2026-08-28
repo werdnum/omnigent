@@ -30,7 +30,23 @@ export interface UserSuggestion {
  * telemetry taxonomy uses. Omitted when the element doesn't fit any of these.
  */
 export type OmnigentComponentKind =
-  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select";
+  "button" | "link" | "input" | "textarea" | "checkbox" | "toggle" | "select" | "tabs";
+
+/**
+ * A multi-phase interaction whose *outcome* or *latency* matters — not just that a
+ * control was clicked. Host-agnostic; the host maps each onto its own taxonomy.
+ *   - `agent_run`      — one user prompt → model run.
+ *   - `tool_call`      — a single tool / skill / MCP invocation within a run.
+ *   - `approval`       — a human-in-the-loop permission decision.
+ *   - `list_sessions`  — loading the session list (user-initiated; not background polls).
+ *   - `get_session`    — loading a single session the user opened / switched to.
+ *   - `create_session` — creating a new session.
+ */
+export type OmnigentInteractionKind =
+  "agent_run" | "tool_call" | "approval" | "list_sessions" | "get_session" | "create_session";
+
+/** Terminal outcome of an interaction, set on the `complete` phase. */
+export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
 
 /**
  * A product-analytics event forwarded to the host. Each carries a stable,
@@ -38,7 +54,9 @@ export type OmnigentComponentKind =
  *
  * PII: `value` on a value-change is only ever set when the emitting call site
  * explicitly declares the value PII-free (see `useOmnigentAnalytics` in
- * `lib/analytics.ts`). Free-form field text is never forwarded.
+ * `lib/analytics.ts`). Free-form field text is never forwarded. Likewise
+ * `interaction_phase.name` must be a bounded, non-PII label (e.g. a tool name
+ * from a fixed set), never user content.
  */
 export type OmnigentAnalyticsEvent =
   | { type: "click"; componentId: string; componentKind?: OmnigentComponentKind }
@@ -48,7 +66,22 @@ export type OmnigentAnalyticsEvent =
       componentKind?: OmnigentComponentKind;
       value?: string | number | boolean;
     }
-  | { type: "page_view"; pageId: string };
+  | { type: "page_view"; pageId: string }
+  | {
+      /**
+       * Start or end of a timed interaction whose outcome or latency matters
+       * (see `OmnigentInteractionKind`). `interactionId` correlates the `start`
+       * and `complete` of one interaction; `status` and `durationMs` are set on
+       * `complete`.
+       */
+      type: "interaction_phase";
+      interactionId: string;
+      interactionKind: OmnigentInteractionKind;
+      phase: "start" | "complete";
+      status?: OmnigentInteractionStatus;
+      name?: string;
+      durationMs?: number;
+    };
 
 export interface OmnigentHostConfig {
   /**
