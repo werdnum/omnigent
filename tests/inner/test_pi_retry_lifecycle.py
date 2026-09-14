@@ -74,18 +74,30 @@ async def test_retry_continues_through_tools_to_final_answer(
     assert [event.response for event in result if isinstance(event, TurnComplete)] == ["Recovered"]
 
 
-async def test_exhausted_retry_reports_final_error(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("message_end_present", [True, False])
+@pytest.mark.parametrize("terminal_message_present", [True, False])
+async def test_exhausted_retry_reports_final_error(
+    monkeypatch: pytest.MonkeyPatch,
+    message_end_present: bool,
+    terminal_message_present: bool,
+) -> None:
     final = _error("503 retry exhausted")
     events = [
         *_retry_events("503 first attempt"),
         {"type": "agent_start"},
-        {"type": "message_end", "message": final},
-        {"type": "agent_end", "messages": [final], "willRetry": False},
+        *([{"type": "message_end", "message": final}] if message_end_present else []),
+        {
+            "type": "agent_end",
+            "messages": [final] if terminal_message_present else [],
+            "willRetry": False,
+        },
         {"type": "auto_retry_end", "success": False, "finalError": final["errorMessage"]},
     ]
     result, _ = await _run(monkeypatch, events)
     assert [event.message for event in result if isinstance(event, ExecutorError)] == [
         "503 retry exhausted"
+        if message_end_present or terminal_message_present
+        else "503 first attempt"
     ]
     assert not any(isinstance(event, TurnComplete) for event in result)
 

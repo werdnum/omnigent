@@ -2678,6 +2678,13 @@ class PiExecutor(Executor):
                     retry_error = pending_error or "Pi retry failed."
                     pending_error = None
                     continue
+                if pending_error is None and retry_error is not None:
+                    pending_error = retry_error
+                    for msg in reversed(event.get("messages", [])):
+                        if isinstance(msg, dict) and msg.get("role") == "assistant":
+                            if msg.get("stopReason") == "error":
+                                pending_error = str(msg.get("errorMessage") or retry_error)
+                            break
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
