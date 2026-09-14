@@ -144,7 +144,7 @@ async def test_eof_during_retry_is_not_partial_success(monkeypatch: pytest.Monke
     assert not any(isinstance(event, TurnComplete) for event in result)
 
 
-@pytest.mark.parametrize("kind", ["text_delta", "thinking_delta"])
+@pytest.mark.parametrize("kind", ["text_delta", "thinking_delta", "thinking_start"])
 async def test_partial_retry_stops_process_without_mixing_answers(
     monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
@@ -173,7 +173,7 @@ async def test_partial_retry_stops_process_without_mixing_answers(
     expected_text = ["Before tool. ", "Partial"] if kind == "text_delta" else ["Before tool. "]
     assert [event.text for event in result if isinstance(event, TextChunk)] == expected_text
     assert [event.delta for event in result if isinstance(event, ReasoningChunk)] == (
-        ["Partial"] if kind == "thinking_delta" else []
+        ["Partial"] if kind == "thinking_delta" else [""] if kind == "thinking_start" else []
     )
     assert [event.message for event in result if isinstance(event, ExecutorError)] == [
         "503 first attempt"

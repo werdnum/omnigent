@@ -2565,6 +2565,7 @@ class PiExecutor(Executor):
                         streamed_any = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
+                    message_had_output = True
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
                 elif ame_type == "thinking_delta":
                     raw_delta = ame.get("delta")
