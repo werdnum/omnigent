@@ -2490,6 +2490,18 @@ class PiExecutor(Executor):
         # Read events until agent_end.
         response_text = ""
         streamed_any = False
+        # Deltas cannot be retracted downstream if Pi retries this message.
+        message_output: list[TextChunk | ReasoningChunk] = []
+
+        def flush_message_output() -> list[TextChunk | ReasoningChunk]:
+            nonlocal response_text, streamed_any, message_output
+            output, message_output = message_output, []
+            for chunk in output:
+                if isinstance(chunk, TextChunk):
+                    response_text += chunk.text
+                    streamed_any = True
+            return output
+
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
@@ -2518,6 +2530,9 @@ class PiExecutor(Executor):
                     # bounded by the harness-level idle watchdog.
                     logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
                     continue
+                if pending_error is None and retry_error is None:
+                    for chunk in flush_message_output():
+                        yield chunk
                 if pending_error is not None or retry_error is not None:
                     yield ExecutorError(message=pending_error or retry_error or "Pi retry failed.")
                 elif not streamed_any and not response_text:
@@ -2558,17 +2573,17 @@ class PiExecutor(Executor):
                 if ame_type == "text_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
-                        yield TextChunk(text=raw_delta)
-                        response_text += raw_delta
-                        streamed_any = True
+                        message_output.append(TextChunk(text=raw_delta))
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
-                    yield ReasoningChunk(delta="", event_type="reasoning_started")
+                    message_output.append(ReasoningChunk(delta="", event_type="reasoning_started"))
                 elif ame_type == "thinking_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
                         # Reasoning stays out of response_text — it is not assistant text.
-                        yield ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
+                        message_output.append(
+                            ReasoningChunk(delta=raw_delta, event_type="reasoning_text")
+                        )
                 continue
 
             # Tool execution events.
@@ -2664,12 +2679,15 @@ class PiExecutor(Executor):
             # Pi can end one attempt while keeping the prompt alive for a retry.
             if event_type == "agent_end":
                 if event.get("willRetry") is True:
+                    message_output.clear()
                     retry_error = pending_error or "Pi retry failed."
                     pending_error = None
                     continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
+                for chunk in flush_message_output():
+                    yield chunk
                 end_messages = event.get("messages", [])
                 if not response_text:
                     for m in reversed(end_messages):
@@ -2716,6 +2734,11 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    if stop in {"error", "aborted"}:
+                        message_output.clear()
+                    elif msg.get("role", "assistant") == "assistant":
+                        for chunk in flush_message_output():
+                            yield chunk
                     if stop == "aborted":
                         err = msg.get("errorMessage", stop)
                         yield ExecutorError(message=str(err))

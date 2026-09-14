@@ -122,3 +122,33 @@ async def test_eof_during_retry_is_not_partial_success(monkeypatch: pytest.Monke
         "503 retry interrupted"
     ]
     assert not any(isinstance(event, TurnComplete) for event in result)
+
+
+async def test_retry_discards_only_failed_message_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    def text(delta: str) -> dict:
+        return {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": delta},
+        }
+
+    events = [
+        text("Before tool. "),
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse"}},
+        {"type": "tool_execution_end", "toolName": "diagnostic", "result": "ok"},
+        text("Discard this partial answer"),
+        *_retry_events("503 first attempt"),
+        {"type": "agent_start"},
+        text("Recovered"),
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+        {"type": "auto_retry_end", "success": True, "attempt": 1},
+        {"type": "agent_end", "messages": [], "willRetry": False},
+    ]
+    result, _ = await _run(monkeypatch, events)
+    assert [event.text for event in result if isinstance(event, TextChunk)] == [
+        "Before tool. ",
+        "Recovered",
+    ]
+    assert [event.response for event in result if isinstance(event, TurnComplete)] == [
+        "Before tool. Recovered"
+    ]
+    assert not any(isinstance(event, ExecutorError) for event in result)
