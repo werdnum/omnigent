@@ -2499,6 +2499,7 @@ class PiExecutor(Executor):
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
+        retry_error: str | None = None
 
         while True:
             # After an errored message the only thing left to drain is the
@@ -2517,8 +2518,8 @@ class PiExecutor(Executor):
                     # bounded by the harness-level idle watchdog.
                     logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
                     continue
-                if pending_error is not None:
-                    yield ExecutorError(message=pending_error)
+                if pending_error is not None or retry_error is not None:
+                    yield ExecutorError(message=pending_error or retry_error or "Pi retry failed.")
                 elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
@@ -2653,8 +2654,19 @@ class PiExecutor(Executor):
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            if event_type == "auto_retry_end":
+                if retry_error is not None and event.get("success") is False:
+                    yield ExecutorError(message=str(event.get("finalError") or retry_error))
+                    return
+                retry_error = None
+                continue
+
+            # Pi can end one attempt while keeping the prompt alive for a retry.
             if event_type == "agent_end":
+                if event.get("willRetry") is True:
+                    retry_error = pending_error or "Pi retry failed."
+                    pending_error = None
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
