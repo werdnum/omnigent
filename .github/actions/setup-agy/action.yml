@@ -1,5 +1,5 @@
 name: Set up Antigravity CLI
-description: Install checksum-pinned, download-cached agy 1.2.4 on Linux x64
+description: Install checksum-pinned, download-cached agy 1.4.4 on Linux x64
 
 runs:
   using: composite

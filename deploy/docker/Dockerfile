@@ -318,8 +318,8 @@ RUN set -eu; \
 #
 # Version + integrity pin: the native harness is behaviorally coupled to a
 # specific agy build (out-of-order transcript writes, connect-RPC quirks, and TUI
-# injection are all verified against 1.1.16 — grep ``agy 1.1.16`` under
-# omnigent/antigravity_native*). The official ``install.sh`` bootstrapper has NO
+# injection; launch, the RPC mirror and permission elicitation were re-verified
+# live against 1.4.4). The official ``install.sh`` bootstrapper has NO
 # version flag — it always fetches the LATEST build from an auto-updater manifest
 # and old builds are not retained at any stable, reconstructable URL — so it
 # cannot pin anything. Instead we fetch the exact, immutable per-arch release
@@ -328,9 +328,9 @@ RUN set -eu; \
 # supply-chain control (a version-string check alone is not). To adopt a new agy:
 # re-verify the coupled behavior, then bump AGY_VERSION and both SHA256s (from
 # https://github.com/google-antigravity/antigravity-cli/releases).
-ARG AGY_VERSION=1.1.16
-ARG AGY_SHA256_AMD64=7742953b7835b457e9102f1357a493913657dfd147435584f609d58356ec085a
-ARG AGY_SHA256_ARM64=c71599bb548cf72dfe7a8f6c411b3c7a3623cd4b0f6276bae89c69f769d6c92d
+ARG AGY_VERSION=1.4.4
+ARG AGY_SHA256_AMD64=9ae4f7f0667a2868e15bb9ad93819ff7527c7187f12d12e3b5191137c726287b
+ARG AGY_SHA256_ARM64=57a96abbc94745a5faf4f24e878766a1882b9aa4c4b83ba567717d8206745f5a
 # Exported for install-harness-cli.sh's agy row, so a build that adds
 # EXTRA_HARNESS_CLIS=agy pins the same version + sha256 as the install above
 # (and UBI — which has no baked agy — pins the same values).

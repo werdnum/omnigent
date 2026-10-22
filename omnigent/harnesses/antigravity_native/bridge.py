@@ -1078,6 +1078,13 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+# Navigation hint at the foot of agy's numbered interaction menus (permission and
+# ask_question). Neither the idle nor the mid-turn footer carries it.
+_AGY_MENU_MARKER = "↑/↓ Navigate"
+# How long to wait for agy to close its own menu after an RPC verdict, and how
+# often to re-check the pane meanwhile.
+_MENU_CLOSE_SETTLE_S = 2.0
+_MENU_CLOSE_POLL_S = 0.2
 # agy collapses a paste carrying many line breaks into a single placeholder row
 # (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
 # The threshold is line-count based — ~13+ line breaks; total length does not
@@ -1808,6 +1815,37 @@ def send_interaction_keys_via_tui(
             "the agy terminal is no longer running (the TUI exited); restart the session"
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, *keys)
+
+
+def interaction_prompt_open_via_tui(
+    bridge_dir: Path,
+    *,
+    settle_s: float = _MENU_CLOSE_SETTLE_S,
+) -> bool:
+    """
+    Return whether agy's interaction menu is still on screen after an RPC verdict.
+
+    Older agy leaves the menu open after the RPC answer, so the bridge types the
+    selection to dismiss it. agy 1.4.4 closes it itself, and those keys would then
+    land in the input box as a stray ``"1"`` chat turn. Polls the pane for
+    :data:`_AGY_MENU_MARKER` for up to *settle_s*. Fails open (``True``) when the
+    pane cannot be read, keeping the legacy dismissal.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :param settle_s: How long to give agy to close its own menu, in seconds.
+    :returns: ``False`` once the menu is confirmed gone, else ``True``.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return True
+    deadline = time.monotonic() + settle_s
+    while True:
+        pane = _capture_pane(info["socket_path"], info["tmux_target"])
+        if pane and _AGY_MENU_MARKER not in pane:
+            return False
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_MENU_CLOSE_POLL_S)
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:

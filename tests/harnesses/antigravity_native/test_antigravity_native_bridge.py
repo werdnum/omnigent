@@ -25,6 +25,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
+    interaction_prompt_open_via_tui,
     prepare_bridge_dir,
     read_bridge_state,
     read_tmux_info,
@@ -2249,6 +2250,54 @@ def test_send_interaction_keys_via_tui_reject_sequence(
     assert captured == [
         ["tmux", "-S", "/tmp/ex/tmux.sock", "send-keys", "-t", "main", "4", "Enter"]
     ]
+
+
+_MENU_PANE = (
+    "Run this command?\n> 1. Yes, run command\n  4. No, cancel\n  ↑/↓ Navigate · enter Confirm\n"
+)
+_IDLE_PANE = "────\n>\n────\n? for shortcuts\n"
+
+
+def _fake_capture(panes: list[str]) -> object:
+    """``subprocess.run`` fake returning *panes* in order (the last one repeats)."""
+    state = {"i": 0}
+
+    def _run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        pane = panes[min(state["i"], len(panes) - 1)]
+        state["i"] += 1
+        return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+
+    return _run
+
+
+@pytest.mark.parametrize(
+    ("panes", "expected"),
+    [
+        pytest.param([_IDLE_PANE], False, id="menu-already-closed"),
+        pytest.param([_MENU_PANE, _IDLE_PANE], False, id="menu-closes-while-settling"),
+        pytest.param([_MENU_PANE], True, id="menu-left-open"),
+        pytest.param([""], True, id="capture-fails"),
+    ],
+)
+def test_interaction_prompt_open_via_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    panes: list[str],
+    expected: bool,
+) -> None:
+    """Only a pane still showing the menu's navigation hint counts as open."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    monkeypatch.setattr("subprocess.run", _fake_capture(panes))
+    monkeypatch.setattr(_mod, "_MENU_CLOSE_POLL_S", 0.0)
+
+    assert interaction_prompt_open_via_tui(bridge_dir, settle_s=0.05) is expected
+
+
+def test_interaction_prompt_open_via_tui_without_target_keeps_dismissal(tmp_path: Path) -> None:
+    """No advertised pane to inspect → assume open so the legacy dismissal still runs."""
+    assert interaction_prompt_open_via_tui(tmp_path / "bridge", settle_s=0.0) is True
 
 
 def test_send_interaction_keys_via_tui_raises_without_target(tmp_path: Path) -> None:

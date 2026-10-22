@@ -3268,6 +3268,7 @@ async def run_reader_with_bridge(
     from omnigent.harnesses.antigravity_native.interactions import (
         bridge_interaction,
         tui_injector_for,
+        tui_prompt_probe_for,
     )
 
     # Mutable current session id: rotation advances it, and the elicitation hook
@@ -3309,6 +3310,7 @@ async def run_reader_with_bridge(
                 # hosting this reader does not carry — that failed every web
                 # approval and left agy's own prompt open in the pane.
                 inject_tui=tui_injector_for(bridge_dir),
+                tui_prompt_open=tui_prompt_probe_for(bridge_dir),
             )
 
         # Cascades a prior rotation attempt failed to bind — the detector skips them

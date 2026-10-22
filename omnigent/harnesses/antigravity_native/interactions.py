@@ -133,6 +133,33 @@ class Deliver(Protocol):
 # in-process prompt (see ``_inject_via_tui`` / the module's "attended TUI" note).
 InjectTui = Callable[[list[str]], Awaitable[None]]
 
+# Reports whether agy's interaction menu is still on screen after an RPC verdict,
+# i.e. whether the post-RPC dismissal keys have anything to dismiss.
+TuiPromptOpen = Callable[[], Awaitable[bool]]
+
+
+async def _assume_prompt_open() -> bool:
+    """Default :class:`TuiPromptOpen`: no pane to inspect, so keep the legacy dismissal."""
+    return True
+
+
+def tui_prompt_probe_for(bridge_dir: Path) -> TuiPromptOpen:
+    """
+    Build a :class:`TuiPromptOpen` that inspects an EXPLICIT bridge's agy pane.
+
+    :param bridge_dir: Native Antigravity bridge directory holding ``tmux.json``.
+    :returns: A probe that is ``False`` once agy has closed its own menu.
+    """
+
+    async def _probe() -> bool:
+        from omnigent.harnesses.antigravity_native.bridge import (
+            interaction_prompt_open_via_tui,
+        )
+
+        return await asyncio.to_thread(interaction_prompt_open_via_tui, bridge_dir)
+
+    return _probe
+
 
 def tui_injector_for(bridge_dir: Path) -> InjectTui:
     """
@@ -331,6 +358,7 @@ async def bridge_interaction(
     request_elicitation: RequestElicitation,
     deliver: Deliver = _deliver_via_rpc,
     inject_tui: InjectTui = _inject_via_tui,
+    tui_prompt_open: TuiPromptOpen = _assume_prompt_open,
     max_retries: int = _DEFAULT_MAX_RETRIES,
 ) -> None:
     """
@@ -372,6 +400,9 @@ async def bridge_interaction(
         delivery channel for persistent approvals; other verdicts use it after
         RPC delivery to dismiss legacy prompts. Failures are logged without
         retrying or falling back to RPC, since keys may have partially arrived.
+    :param tui_prompt_open: Checked after an RPC verdict, before the dismissal
+        keys. Newer agy closes its menu itself, and keys typed into the restored
+        input box would reach the agent as a stray chat turn.
     :param max_retries: Upper bound on detect→deliver iterations.
     :returns: None. Never raises on the expected timeout/cancel/RPC-error paths —
         all are logged and end the loop so the long-lived caller stays alive.
@@ -469,6 +500,8 @@ async def bridge_interaction(
             # Older agy versions can leave the attended prompt open after RPC.
             if keys:
                 try:
+                    if not await tui_prompt_open():
+                        return  # agy closed its own menu; nothing to dismiss
                     await inject_tui(keys)
                 except Exception as tui_exc:
                     # Best-effort TUI dismissal — the backend step is already

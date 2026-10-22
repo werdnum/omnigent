@@ -662,6 +662,46 @@ async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt_open", "expected_keys"),
+    [
+        pytest.param(True, [["1", "Enter"]], id="menu-left-open"),
+        pytest.param(False, [], id="agy-closed-menu"),
+    ],
+)
+async def test_rpc_verdict_dismisses_menu_only_while_it_is_open(
+    prompt_open: bool, expected_keys: list[list[str]]
+) -> None:
+    """After an RPC verdict, keys are typed only if agy left its menu open.
+
+    Newer agy closes the menu itself; typing ``1`` + Enter then would reach the
+    agent as a stray chat turn.
+    """
+    pending = _pending_permission(step_index=2)
+    waiting = _permission_step(step_index=2)
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    async def _prompt_open() -> bool:
+        return prompt_open
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+        tui_prompt_open=_prompt_open,
+    )
+
+    assert len(deliver.calls) == 1
+    assert inject_tui.calls == expected_keys
+
+
+@pytest.mark.asyncio
 async def test_no_tui_keystroke_when_nothing_delivered() -> None:
     """When the elicitation returns None (timeout/cancel), no TUI key is typed."""
     pending = _pending_permission(step_index=2)
