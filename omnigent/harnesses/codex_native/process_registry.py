@@ -36,6 +36,9 @@ class CodexNativeProcessEntry:
     :param pgid: Child process group id.
     :param tmux_session_name: Optional tmux session name owned by the child.
     :param session_tag: Unique tag also embedded in the child command line.
+    :param process_start_identity: Kernel-backed process birth identity used
+        to distinguish the registered child from a later process reusing its
+        PID. ``None`` is accepted for entries written by older versions.
     :param owner_lock_path: Lock file held by the parent while it owns
         the child. If the lock is still held during reconciliation, the
         child is a live sibling and must not be reaped.
@@ -45,6 +48,7 @@ class CodexNativeProcessEntry:
     pgid: int
     tmux_session_name: str | None
     session_tag: str
+    process_start_identity: str | None = None
     owner_lock_path: str | None = None
 
 
@@ -155,6 +159,7 @@ def register_codex_native_process(
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=_process_start_identity(pid),
         owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
     )
     path = registry_path or codex_native_process_registry_path()
@@ -190,8 +195,9 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     """
     Reap crash-leftover native Codex children recorded by prior runs.
 
-    PID reuse is guarded by requiring the live process command line to
-    still contain the entry's unique session tag before killing anything.
+    PID reuse is guarded by comparing the process birth identity recorded at
+    spawn. Older entries without that identity retain the command-line tag
+    fallback.
 
     :param registry_path: Test override for the registry file path.
     :returns: None.
@@ -203,11 +209,13 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
                 continue
-            if not _pid_alive(entry.pid):
+            matches_entry = _process_matches_entry(entry)
+            if matches_entry is None:
+                survivors.append(entry)
                 continue
-            if not _process_cmdline_has_tag(entry.pid, entry.session_tag):
+            if not matches_entry:
                 continue
-            if not _terminate_process_group(entry.pgid):
+            if not _terminate_process_group(entry):
                 survivors.append(entry)
                 continue
             _reap_tmux_session(entry.tmux_session_name)
@@ -279,7 +287,12 @@ def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
 def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        payload = [asdict(entry) for entry in entries]
+        payload = []
+        for entry in entries:
+            item = asdict(entry)
+            if entry.process_start_identity is None:
+                item.pop("process_start_identity")
+            payload.append(item)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         os.replace(tmp, path)
@@ -293,6 +306,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     pid = item.get("pid")
     pgid = item.get("pgid")
     session_tag = item.get("session_tag")
+    process_start_identity = item.get("process_start_identity")
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
     if not isinstance(pid, int) or pid <= 0:
@@ -301,6 +315,8 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         return None
     if not isinstance(session_tag, str) or not session_tag:
         return None
+    if process_start_identity is not None and not isinstance(process_start_identity, str):
+        process_start_identity = None
     if tmux_session_name is not None and not isinstance(tmux_session_name, str):
         tmux_session_name = None
     if owner_lock_path is not None and not isinstance(owner_lock_path, str):
@@ -310,6 +326,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=process_start_identity,
         owner_lock_path=owner_lock_path,
     )
 
@@ -352,6 +369,44 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
+    if entry.process_start_identity is not None:
+        current_identity = _process_start_identity(entry.pid)
+        if current_identity is None:
+            return None if _pid_alive(entry.pid) else False
+        return current_identity == entry.process_start_identity
+    if not _pid_alive(entry.pid):
+        return False
+    cmdline = _process_cmdline(entry.pid)
+    if not cmdline:
+        return None
+    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline
+
+
+def _process_start_identity(pid: int) -> str | None:
+    proc_stat = Path("/proc") / str(pid) / "stat"
+    with contextlib.suppress(OSError, IndexError):
+        raw = proc_stat.read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        start_ticks = fields_after_name[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        if boot_id:
+            return f"linux:{boot_id}:{start_ticks}"
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-ww", "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    started_at = proc.stdout.strip()
+    return f"ps:{started_at}" if proc.returncode == 0 and started_at else None
+
+
 def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
     needle = codex_native_session_tag_cmdline_arg(session_tag)
     cmdline = _process_cmdline(pid)
@@ -370,7 +425,8 @@ def _process_cmdline(pid: int) -> str:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -378,16 +434,28 @@ def _process_cmdline(pid: int) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _terminate_process_group(pgid: int) -> bool:
-    if os.name == "posix":
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return True
-        except (PermissionError, OSError):
-            return False
+def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:
+    if not _process_group_matches_entry(entry):
+        return False
+    try:
+        os.killpg(entry.pgid, signal.SIGTERM)
+    except ProcessLookupError:
         return True
-    return False
+    except (PermissionError, OSError):
+        return False
+    return True
+
+
+def _process_group_matches_entry(entry: CodexNativeProcessEntry) -> bool:
+    if os.name != "posix" or entry.pgid <= 1:
+        return False
+    try:
+        current_pgid = os.getpgid(entry.pid)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return False
+    return current_pgid == entry.pgid and current_pgid != os.getpgrp()
 
 
 def _reap_tmux_session(tmux_session_name: str | None) -> None:
@@ -422,6 +490,79 @@ def _kill_tmux_session(tmux_session_name: str) -> None:
         )
 
 
+def _live_codex_app_server_processes(state_dir: Path) -> dict[int, int] | None:
+    """
+    Map live Codex app-server pids to pgids for *state_dir*'s session.
+
+    Identity is the session state dir baked into the app-server command
+    line (its ``-c`` config overrides name the bridge dir), which — unlike
+    the argv0 crash tag — survives the npm shim's ``exec``.
+
+    :param state_dir: The session's codex-native state dir, e.g.
+        ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
+    :returns: ``pid -> pgid`` for matching live processes, or ``None`` when
+        the process table could not be listed (non-posix, or ``ps`` failed
+        or exited nonzero).
+    """
+    if os.name != "posix":
+        return None
+    raw = str(state_dir)
+    # The bridge MCP args reach the command line JSON-encoded (see
+    # ``bridge.codex_mcp_config_overrides``), which escapes non-ASCII as
+    # ``\uXXXX``: match that spelling too so a live owner is never missed.
+    needles = {raw, json.dumps(raw)[1:-1]}
+    try:
+        # macOS ps passes raw argv bytes through, so decode leniently: one
+        # foreign process with non-UTF-8 argv must not crash the caller.
+        result = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,pgid=,command="],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        # An unsuccessful listing is unknown, never "no owner".
+        return None
+    listing = result.stdout or ""
+    own_pgid = os.getpgid(0)
+    matches: dict[int, int] = {}
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        pid_text, pgid_text, command = parts
+        try:
+            pid, pgid = int(pid_text), int(pgid_text)
+        except ValueError:
+            continue
+        # "app-server" scopes the match to the codex app-server itself (the
+        # session's bridge MCP child also carries the state dir, but it is a
+        # member of the app-server's process group and dies with it).
+        if "app-server" not in command or not any(n in command for n in needles):
+            continue
+        if pid == os.getpid() or pgid <= 0 or pgid == own_pgid:
+            continue
+        matches[pid] = pgid
+    return matches
+
+
+def codex_native_process_alive_for_state_dir(state_dir: Path) -> bool:
+    """
+    Report whether a live Codex app-server is still bound to *state_dir*.
+
+    :param state_dir: The session's codex-native state dir.
+    :returns: ``True`` when a matching process is live — or when liveness
+        could not be determined, so callers that need proof of death treat
+        the unknown case as alive.
+    """
+    live = _live_codex_app_server_processes(state_dir)
+    return live is None or bool(live)
+
+
 def reap_codex_native_processes_for_state_dir(
     state_dir: Path,
     *,
@@ -435,11 +576,9 @@ def reap_codex_native_processes_for_state_dir(
     session, survives, and keeps holding the codex thread's writer lock —
     so every later ``thread/resume`` for the session is refused with
     "already has an active writer". Launch time is when that matters, so
-    the launch path calls this first. Identity is the session state dir
-    baked into the app-server command line (its ``-c`` config overrides
-    name the bridge dir), which — unlike the argv0 crash tag — survives
-    the npm shim's ``exec``. Matches are killed by process group, taking
-    their bridge/hook children with them.
+    the launch path calls this first. Matches (see
+    :func:`_live_codex_app_server_processes` for the identity) are killed
+    by process group, taking their bridge/hook children with them.
 
     :param state_dir: The session's codex-native state dir, e.g.
         ``~/.omnigent/codex-native/<sha256(session)[:32]>``.
@@ -447,38 +586,7 @@ def reap_codex_native_processes_for_state_dir(
         survivors to SIGKILL, e.g. ``1.5``.
     :returns: Number of matched processes signalled.
     """
-    if os.name != "posix":
-        return 0
-    needle = str(state_dir)
-    try:
-        listing = subprocess.run(
-            ["ps", "-axww", "-o", "pid=,pgid=,command="],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
-    own_pgid = os.getpgid(0)
-    victims: dict[int, int] = {}
-    for line in listing.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3:
-            continue
-        pid_text, pgid_text, command = parts
-        try:
-            pid, pgid = int(pid_text), int(pgid_text)
-        except ValueError:
-            continue
-        # "app-server" scopes the match to the codex app-server itself (the
-        # session's bridge MCP child also carries the state dir, but it is a
-        # member of the app-server's process group and dies with it).
-        if needle not in command or "app-server" not in command:
-            continue
-        if pid == os.getpid() or pgid <= 0 or pgid == own_pgid:
-            continue
-        victims[pid] = pgid
+    victims = _live_codex_app_server_processes(state_dir)
     if not victims:
         return 0
     for pgid in sorted(set(victims.values())):

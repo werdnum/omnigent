@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { serializeReplyDraft, type StoredReplyDraft } from "./replyDraft";
 
 const key = "omnigent.sessionDrafts";
@@ -9,6 +10,7 @@ describe("session drafts", () => {
     sessionStorage.clear();
   });
   afterEach(() => sessionStorage.clear());
+  afterEach(cleanup);
 
   it("loads legacy string drafts as plain text without inferring cards", async () => {
     const text = "\nintro\n> quote\nlazy continuation\n\n";
@@ -72,5 +74,68 @@ describe("session drafts", () => {
     setSessionDraft("conversation", { text: "", files: [] });
     expect(hasSessionDraft("conversation")).toBe(false);
     expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
+  it("recovers a failed temporary draft and ignores its late cleanup write", async () => {
+    const { getSessionDraft, recoverFailedSessionDraft, setSessionDraft } =
+      await import("./sessionDrafts");
+    const originalFile = new File(["initial"], "initial.txt");
+    const followUpFile = new File(["follow-up"], "follow-up.txt");
+    const temporaryDraft = {
+      text: "follow-up typed during startup",
+      files: [followUpFile],
+    };
+    setSessionDraft("temp:failed", temporaryDraft);
+
+    expect(
+      recoverFailedSessionDraft(
+        { message: "original create prompt", files: [originalFile], project: "docs" },
+        "temp:failed",
+      ),
+    ).toEqual({
+      message: "original create prompt\n\nfollow-up typed during startup",
+      files: [originalFile, followUpFile],
+      project: "docs",
+    });
+    expect(getSessionDraft("temp:failed")).toBeUndefined();
+
+    setSessionDraft("temp:failed", temporaryDraft);
+    expect(getSessionDraft("temp:failed")).toBeUndefined();
+    expect(sessionStorage.getItem(key)).toBeNull();
+  });
+
+  it("re-renders useSessionDraftIds only when the set of draft ids changes", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds();
+    });
+    expect(result.current).toBe("");
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("a");
+    const afterAdd = renders;
+
+    // Editing an existing draft's text leaves the id set unchanged, so no re-render.
+    act(() => setSessionDraft("a", { text: "hello again", files: [] }));
+    expect(renders).toBe(afterAdd);
+
+    act(() => setSessionDraft("a", { text: "", files: [] }));
+    expect(result.current).toBe("");
+  });
+
+  it("returns an empty snapshot without subscribing when disabled", async () => {
+    const { setSessionDraft, useSessionDraftIds } = await import("./sessionDrafts");
+    let renders = 0;
+    const { result } = renderHook(() => {
+      renders += 1;
+      return useSessionDraftIds(false);
+    });
+    const before = renders;
+
+    act(() => setSessionDraft("a", { text: "hi", files: [] }));
+    expect(result.current).toBe("");
+    expect(renders).toBe(before);
   });
 });

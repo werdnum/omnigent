@@ -1,6 +1,6 @@
 """Host identity management for ``omnigent host``.
 
-Reads or creates the ``host`` section in ``~/.omnigent/config.yaml``.
+Reads or creates the ``host`` section in the user-level ``config.yaml``.
 The host identity is auto-generated on first ``omnigent host``
 if the section does not exist.
 """
@@ -17,18 +17,19 @@ from pathlib import Path
 
 import yaml
 
+from omnigent.config import global_config_path
+from omnigent.host import identity_env
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
+
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
-# Env vars a server-managed sandbox host is launched with. The server
-# provisions the sandbox, generates the identity + launch token, and
-# injects all three so the host registers under the server-chosen
-# identity without persisting anything to the sandbox's config.yaml
-# (managed sandboxes are disposable). HOST_TOKEN is the tunnel
-# credential (see MANAGED_HOST_TOKEN_HEADER); HOST_ID / HOST_NAME
-# override the identity file and must be set together.
-HOST_TOKEN_ENV_VAR = "OMNIGENT_HOST_TOKEN"
-HOST_ID_ENV_VAR = "OMNIGENT_HOST_ID"
-HOST_NAME_ENV_VAR = "OMNIGENT_HOST_NAME"
+# The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the dependency-free
+# leaf module omnigent.host.identity_env so the warm-pool readiness probe can
+# read them without importing this module's YAML/config dependencies. Bind them
+# here too so existing ``omnigent.host.identity`` callers keep working.
+HOST_ID_ENV_VAR = identity_env.HOST_ID_ENV_VAR
+HOST_NAME_ENV_VAR = identity_env.HOST_NAME_ENV_VAR
+HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 
 # WebSocket upgrade header carrying a managed host's launch token.
 # Mirrors the runner tunnel's X-Omnigent-Runner-Tunnel-Token pattern:
@@ -53,6 +54,37 @@ class HostIdentity:
     name: str
 
 
+HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
+
+
+def export_configured_slice_key(path: Path) -> None:
+    """Export ``host.slice_key_enabled`` from *path* as the slice-key env var.
+
+    A managed launch writes the setting into the sandbox's config; exporting it
+    once at host startup lets the request-header builder and the host's runners
+    (which inherit the env var) all agree. An env var already set wins.
+
+    :param path: The host's ``config.yaml``.
+    """
+    if os.environ.get(HOST_SLICE_KEY_ENABLED_ENV_VAR) is not None or not path.exists():
+        return
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except yaml.YAMLError:
+        # Malformed config is reported by the identity load, not here.
+        return
+    host_section = cfg.get("host") if isinstance(cfg, dict) else None
+    enabled = host_section.get("slice_key_enabled") if isinstance(host_section, dict) else None
+    if isinstance(enabled, bool):
+        os.environ[HOST_SLICE_KEY_ENABLED_ENV_VAR] = "1" if enabled else "0"
+
+
+def host_config_path(path: Path | None = None) -> Path:
+    """Return the effective config path used for host identity."""
+    return path if path is not None else global_config_path(CONFIG_PATH)
+
+
 def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     """Normalize *host_id* and verify it is a valid (UUID-shaped) host id.
 
@@ -66,9 +98,8 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     process from the env override or config file, turns that confusing
     remote rejection into a loud, local, actionable error.
 
-    Reuses the server's own ``uuid_to_bytes`` (imported lazily so the host
-    CLI's common auto-generate path never pulls in the DB/sqlalchemy
-    module) so the client and server accept exactly the same id shapes.
+    Reuses the database column's canonical normalizer without importing the
+    server's ORM models into the host process.
 
     :param host_id: The raw host id from the env override or config file.
     :param source: Where it came from, named in the error (e.g. the env var).
@@ -76,8 +107,6 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     :returns: The normalized (to bare hex, legacy-prefix-stripped) host id.
     :raises ValueError: If *host_id* is not a valid uuid-shaped host id.
     """
-    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
-
     try:
         # Validate and normalize to bare hex (16 bytes -> 32-char hex string)
         normalized = uuid_to_bytes(host_id).hex()
@@ -91,7 +120,7 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
 
 
 def load_or_create_host_identity(
-    path: Path = CONFIG_PATH,
+    path: Path | None = None,
 ) -> HostIdentity:
     """Load host identity from config.yaml, or create it if absent.
 
@@ -113,12 +142,12 @@ def load_or_create_host_identity(
     server owns their identity. Setting only one of the two is a
     launcher bug and fails loud.
 
-    :param path: Path to the config YAML file, e.g.
-        ``Path("~/.omnigent/config.yaml")``. Defaults to
-        :data:`CONFIG_PATH`.
+    :param path: Optional config YAML path. Defaults to the user-level path,
+        honoring ``OMNIGENT_CONFIG_HOME`` when set.
     :returns: The loaded or newly created :class:`HostIdentity`.
     :raises ValueError: If exactly one of the identity env vars is set.
     """
+    path = host_config_path(path)
     env_host_id = os.environ.get(HOST_ID_ENV_VAR)
     env_name = os.environ.get(HOST_NAME_ENV_VAR)
     if (env_host_id is None) != (env_name is None):
@@ -187,7 +216,7 @@ def load_or_create_host_identity(
     return identity
 
 
-def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
+def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     """Replace this machine's persisted ``host_id`` with a fresh one.
 
     The recovery path for a host registration owned by another identity:
@@ -200,10 +229,12 @@ def reset_host_id(path: Path = CONFIG_PATH) -> tuple[str | None, str]:
     ``host_id`` changes. A missing config or host section is created, same
     as :func:`load_or_create_host_identity`.
 
-    :param path: Path to the config YAML file. Defaults to :data:`CONFIG_PATH`.
+    :param path: Optional config YAML path. Defaults to the user-level path,
+        honoring ``OMNIGENT_CONFIG_HOME`` when set.
     :returns: ``(old_host_id, new_host_id)`` — ``old_host_id`` is ``None``
         when no identity was persisted before.
     """
+    path = host_config_path(path)
     cfg: dict[str, object] = {}
     if path.exists():
         with open(path) as f:
@@ -260,7 +291,7 @@ def host_identity_env_override_active() -> bool:
 
 
 def load_host_identity_if_present(
-    path: Path = CONFIG_PATH,
+    path: Path | None = None,
 ) -> HostIdentity | None:
     """Return the host identity if one already exists, else ``None`` — no create.
 
@@ -281,10 +312,12 @@ def load_host_identity_if_present(
     ``omnigent host`` launch path (:func:`load_or_create_host_identity`), where
     a bad id is the thing the operator is trying to use.
 
-    :param path: Path to the config YAML file. Defaults to :data:`CONFIG_PATH`.
+    :param path: Optional config YAML path. Defaults to the user-level path,
+        honoring ``OMNIGENT_CONFIG_HOME`` when set.
     :returns: The existing :class:`HostIdentity`, or ``None`` when no usable
         identity is present (absent, half-specified, or invalid).
     """
+    path = host_config_path(path)
     env_host_id = os.environ.get(HOST_ID_ENV_VAR)
     env_name = os.environ.get(HOST_NAME_ENV_VAR)
     if (env_host_id is None) != (env_name is None):

@@ -1,12 +1,14 @@
 "use client";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
-import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+import { showToast } from "@/components/ui/toast";
+import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
-import { MicIcon, SquareIcon } from "lucide-react";
+import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
@@ -89,6 +91,9 @@ export interface ComposerMicButtonProps {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
+  /** Called when a take starts or ends listening; while listening, Enter and Esc
+   *  belong to dictation. */
+  onListeningChange?: (listening: boolean) => void;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -105,6 +110,7 @@ export const ComposerMicButton = ({
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
+  onListeningChange,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
@@ -122,6 +128,10 @@ export const ComposerMicButton = ({
   const serverAvailableRef = useRef(serverAvailable);
   serverAvailableRef.current = serverAvailable;
   const [isListening, setIsListening] = useState(false);
+  // Server-path only: the take has started but audio isn't flowing yet (the
+  // first take cold-loads the model, up to ~40s). Shows a spinner so the click
+  // isn't a dead-looking button until it flips to listening.
+  const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const sessionRef = useRef<DictationSession | null>(null);
@@ -135,6 +145,13 @@ export const ComposerMicButton = ({
   onVoiceStartRef.current = onVoiceStart;
   const onVoiceDiscardRef = useRef(onVoiceDiscard);
   onVoiceDiscardRef.current = onVoiceDiscard;
+  const onListeningChangeRef = useRef(onListeningChange);
+  onListeningChangeRef.current = onListeningChange;
+  useEffect(() => {
+    if (!isListening) return;
+    onListeningChangeRef.current?.(true);
+    return () => onListeningChangeRef.current?.(false);
+  }, [isListening]);
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
@@ -154,6 +171,18 @@ export const ComposerMicButton = ({
   // Lets the mount-time Web Speech error handler start the fallback take
   // without closing over toggleServer's identity.
   const toggleServerRef = useRef<() => Promise<void>>(async () => {});
+  // Latest server partial for the current take, so a crash can preserve what
+  // was spoken instead of blanking it. Set on each partial, cleared on final,
+  // and reset when a take starts so a stale partial can't resurrect.
+  const interimRef = useRef("");
+
+  // Surface a failure both in the button (tooltip + red tint) and as a toast,
+  // so a failed take is an explained error rather than a silent flash back to
+  // the idle mic. Stable identity: only setError/showToast, both stable.
+  const reportError = useCallback((message: string) => {
+    setError(message);
+    showToast(message);
+  }, []);
 
   // Written via .style.transform from rAF — avoids 60Hz React re-renders.
   const barRefs = useRef<(HTMLSpanElement | null)[]>(BAR_BINS.map(() => null));
@@ -190,20 +219,22 @@ export const ComposerMicButton = ({
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
-      // "network" means the recognizer's cloud backend refused us —
-      // always the case in Electron/plain Chromium, occasionally a
-      // transient blip in real Chrome. Serve THIS take from the server
-      // instead; the next take tries Web Speech again.
-      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+      // An unavailable or blocked speech service can still use client mic
+      // capture with server transcription. getUserMedia checks mic permission.
+      if (
+        (err === "network" || err === "service-not-allowed") &&
+        serverAvailableRef.current &&
+        !disabledRef.current
+      ) {
         setIsListening(false);
         void toggleServerRef.current();
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
-      if (err === "not-allowed" || err === "service-not-allowed") {
-        setError("Microphone permission denied");
+      if (err === "not-allowed") {
+        reportError("Microphone access denied. Allow access and try again.");
       } else if (err && err !== "no-speech" && err !== "aborted") {
-        setError("Dictation unavailable");
+        reportError("Voice input isn't available on this device.");
       }
       setIsListening(false);
     };
@@ -237,7 +268,7 @@ export const ComposerMicButton = ({
       recognition.stop();
       recognitionRef.current = null;
     };
-  }, [Ctor, lang]);
+  }, [Ctor, lang, reportError]);
 
   // Auto-stop if the composer goes disabled mid-dictation. Stops the
   // recognizer; the disabledRef guard in handleResult catches any final
@@ -361,14 +392,20 @@ export const ComposerMicButton = ({
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
+      interimRef.current = "";
+      setConnecting(true);
       onVoiceStartRef.current?.();
       const next = await DictationSession.start({
         onPartial: (text) => {
           // Drop late partials after an Esc discard — they'd repopulate the
           // composer the parent just reverted.
-          if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
+          if (!disabledRef.current && !discardingRef.current) {
+            interimRef.current = text;
+            onInterimRef.current?.(text);
+          }
         },
         onFinal: (text) => {
+          interimRef.current = "";
           const trimmed = text.trim();
           if (trimmed && !disabledRef.current && !discardingRef.current) {
             onTranscriptRef.current(trimmed);
@@ -376,26 +413,38 @@ export const ComposerMicButton = ({
         },
         onError: () => {
           sessionRef.current = null;
-          setError("Dictation unavailable");
+          // Preserve anything spoken but not yet finalized: pin the pending
+          // partial as a final rather than blanking it, so a crash mid-take
+          // doesn't discard the user's words.
+          const pending = interimRef.current.trim();
+          interimRef.current = "";
+          if (pending && !disabledRef.current && !discardingRef.current) {
+            onTranscriptRef.current(pending);
+          } else {
+            onInterimRef.current?.("");
+          }
+          reportError("Voice input failed. Please try again.");
           setIsListening(false);
-          onInterimRef.current?.("");
         },
       });
       sessionRef.current = next;
       setError(null);
       setIsListening(true);
     } catch (startError) {
-      setError(
+      reportError(
         startError instanceof DictationBusyError
-          ? "Dictation is busy — try again shortly"
+          ? "Voice input is busy. Please try again shortly."
           : isPermissionError(startError)
-            ? "Microphone permission denied"
-            : "Dictation unavailable",
+            ? "Microphone access denied. Allow access and try again."
+            : "Voice input isn't available on this device.",
       );
       setIsListening(false);
     }
+    // Reached only by the start path (the stop branch returns earlier), so this
+    // clears the handshake spinner on both success and failure.
+    setConnecting(false);
     serverBusyRef.current = false;
-  }, []);
+  }, [reportError]);
   toggleServerRef.current = toggleServer;
 
   const toggle = useCallback(() => {
@@ -432,7 +481,8 @@ export const ComposerMicButton = ({
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // whenever dictation could run (Web Speech OR the server path) and the
   // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  const hotkeyEnabled = enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled;
+  useVoiceDictationHotkey(toggle, hotkeyEnabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -480,47 +530,59 @@ export const ComposerMicButton = ({
   // Stable accessible name with aria-pressed signals toggle state to
   // screen readers. Error text takes over the tooltip when set.
   const a11yLabel = "Voice dictation";
-  const tooltip = error ?? a11yLabel;
+  const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
 
   return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={disabled}
-      onClick={toggle}
-      aria-pressed={isListening}
-      aria-label={a11yLabel}
-      title={tooltip}
-      className={cn(
-        "size-9 md:size-8",
-        isListening &&
-          "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
-        error && "text-destructive",
-        className,
-      )}
+    <KeyboardShortcutTooltip
+      label={tooltip}
+      keys={hotkeyEnabled ? VOICE_DICTATION_KEYS : undefined}
     >
-      {isListening ? (
-        // Bars fade out and stop icon fades in on hover OR keyboard focus,
-        // so keyboard users get the stop affordance without needing hover.
-        <span className="relative flex size-4 items-center justify-center" aria-hidden>
-          <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
-            {BAR_BINS.map(([lo, hi], i) => (
-              <span
-                key={`${lo}-${hi}`}
-                ref={(el) => {
-                  barRefs.current[i] = el;
-                }}
-                className="block h-3 w-[2px] origin-center rounded-full bg-current"
-                style={{ transform: `scaleY(${BAR_BASELINE})` }}
-              />
-            ))}
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        disabled={disabled}
+        onClick={toggle}
+        aria-pressed={isListening}
+        // While listening, Escape cancels dictation before page-wide shortcuts see it.
+        data-escape-owner={isListening ? "" : undefined}
+        aria-busy={connecting}
+        aria-label={a11yLabel}
+        data-composer-action="microphone"
+        data-server-dictation-available={serverAvailable}
+        data-dictating={isListening || undefined}
+        className={cn(
+          "size-9 mobile-touch-target md:size-8",
+          isListening &&
+            "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
+          error && "text-destructive",
+          className,
+        )}
+      >
+        {connecting ? (
+          <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+        ) : isListening ? (
+          // Bars fade out and stop icon fades in on hover OR keyboard focus,
+          // so keyboard users get the stop affordance without needing hover.
+          <span className="relative flex size-4 items-center justify-center" aria-hidden>
+            <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
+              {BAR_BINS.map(([lo, hi], i) => (
+                <span
+                  key={`${lo}-${hi}`}
+                  ref={(el) => {
+                    barRefs.current[i] = el;
+                  }}
+                  className="block h-3 w-[2px] origin-center rounded-full bg-current"
+                  style={{ transform: `scaleY(${BAR_BASELINE})` }}
+                />
+              ))}
+            </span>
+            <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
           </span>
-          <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
-        </span>
-      ) : (
-        <MicIcon className="size-4" data-icon-size="16" />
-      )}
-    </Button>
+        ) : (
+          <MicIcon className="size-4" data-icon-size="16" />
+        )}
+      </Button>
+    </KeyboardShortcutTooltip>
   );
 };

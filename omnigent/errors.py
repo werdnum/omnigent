@@ -11,7 +11,23 @@ New code should prefer OmnigentError for consistency.
 
 from __future__ import annotations
 
+import errno
+import functools
+import inspect
+from collections.abc import Callable
 from enum import Enum
+from typing import Any, ParamSpec, TypeVar, cast
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class HarnessTransportClosedError(RuntimeError):
+    """A native harness channel ended; replay requires explicit safety evidence."""
+
+    def __init__(self, message: str, *, replay_safe: bool = False) -> None:
+        super().__init__(message)
+        self.replay_safe = replay_safe
 
 
 class ErrorCategory(str, Enum):
@@ -163,6 +179,9 @@ class ErrorCode:
         §Elicitation completion invariant.
     :cvar RUNNER_UNAVAILABLE: No online runner can serve the
         requested dispatch (HTTP 503).
+    :cvar HOST_OFFLINE: A native message found its session's user-run
+        host offline, and the client said it keeps the message and sends it
+        once the host reconnects (HTTP 503). Nothing was recorded.
     :cvar WRONG_REPLICA: The session's bound runner exists but its
         tunnel is not registered on the replica that served this request
         (HTTP 400). When replicas are sharded by host, a request keyed for
@@ -187,6 +206,36 @@ class ErrorCode:
         exists on the selected host (HTTP 410). Retrying cannot recreate
         deleted workspace state; the user must start a session in a valid
         workspace.
+    :cvar SESSION_AGENT_MISSING: The session's bound agent no longer
+        resolves — its stored bundle was deleted or rebound out from under
+        an active session (HTTP 410). A session-lifecycle condition, not a
+        terminal-startup or spec-resolution defect: retrying cannot recreate
+        the removed agent, so the user must recreate the agent or start a new
+        session. Distinct from ``NOT_FOUND`` so terminal-ensure and
+        turn-dispatch failures caused by a vanished agent are attributed to
+        the lifecycle event rather than a generic runner startup fault.
+    :cvar UPSTREAM_CANCELLED: A backing upstream call (e.g. a gRPC
+        dependency behind an embedding route) was cancelled by its peer
+        mid-flight — an upstream teardown or restart, not our fault and
+        not the caller's input. HTTP 499 (the "client closed request"
+        family the gRPC CANCELLED status conventionally maps to): a 4xx
+        keeps this expected, retryable condition out of 5xx fault-rate
+        signals, the same reasoning as ``WRONG_REPLICA``.
+    :cvar UPSTREAM_PERMISSION_DENIED: A backing upstream call (e.g. a
+        workspace-hierarchy gRPC dependency behind an embedding route)
+        refused the call with ``PERMISSION_DENIED`` — an access outcome,
+        not a fault. HTTP 403, but distinct from ``FORBIDDEN``: the
+        denial is issued by the dependency, and whether the user lacks
+        access there or the service dropped its auth context is decided
+        upstream, so it must not read as our own authorization layer
+        rejecting the request.
+    :cvar STALE_CURSOR: A pagination cursor (``after``/``before``)
+        references a row that no longer exists — typically deleted
+        between two page fetches (HTTP 400). Without a distinct signal
+        the next page reads as empty with ``has_more=false``,
+        indistinguishable from a completed enumeration, so the caller
+        silently loses the remaining rows. The caller's remedy is to
+        restart the enumeration without the cursor.
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -198,12 +247,31 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    HOST_OFFLINE = "host_offline"
     WRONG_REPLICA = "wrong_replica"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    REFRESH_UNSUPPORTED = "refresh_unsupported"
+    LOGIN_UNSUPPORTED = "login_unsupported"
     WORKSPACE_MISSING = "workspace_missing"
+    SESSION_AGENT_MISSING = "session_agent_missing"
+    UPSTREAM_CANCELLED = "upstream_cancelled"
+    UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
+    STALE_CURSOR = "stale_cursor"
+
+
+# Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
+# removed (``omnigent agent remove``), so the session can't load it.
+SESSION_AGENT_MISSING_MESSAGE = (
+    "This agent no longer exists. Fork this session into another agent to continue."
+)
+
+SESSION_AGENT_BUNDLE_MISSING_MESSAGE = (
+    "This agent's bundle no longer exists, so it cannot be copied. "
+    "Choose another agent to continue."
+)
 
 
 # Single source of truth for error code → HTTP status.
@@ -220,6 +288,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    # 503 like RUNNER_UNAVAILABLE: the send succeeds once the host is back.
+    ErrorCode.HOST_OFFLINE: 503,
     # 400, not 503: the request reached a replica that can't serve it, but the
     # request is valid — the fix is to re-address it (reissue without the key),
     # not to wait and retry. A 4xx also keeps this expected routing event out of
@@ -233,7 +303,23 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.REFRESH_UNSUPPORTED: 409,
+    ErrorCode.LOGIN_UNSUPPORTED: 409,
     ErrorCode.WORKSPACE_MISSING: 410,
+    # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
+    # deleted; a retry cannot recreate it.
+    ErrorCode.SESSION_AGENT_MISSING: 410,
+    # 499, not 5xx: the peer cancelling an in-flight backing call is expected
+    # and retryable, so it must not read as a server fault (see the cvar).
+    ErrorCode.UPSTREAM_CANCELLED: 499,
+    # 403: the upstream denial is an access outcome for this one request, not
+    # a server fault; the distinct code keeps it separable from our own authz
+    # FORBIDDEN in dashboards and client handling.
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: 403,
+    # 400: the referenced cursor row is gone, so this exact request can never
+    # succeed — the fix is to restart the enumeration without the cursor. The
+    # distinct code is what a paging client keys that restart off.
+    ErrorCode.STALE_CURSOR: 400,
 }
 
 
@@ -259,10 +345,25 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A valid request the caller cannot fix by retry or re-input; the
     # deployment/host must change.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorCategory.CONFIG,
+    # The human's own machine is asleep or disconnected.
+    ErrorCode.HOST_OFFLINE: ErrorCategory.USER,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorCategory.CONFIG,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
+    # The session's agent was deleted or rebound; the caller must recreate the
+    # agent or start a new session. Not a runner/server fault.
+    ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
+    # A dependency tore down the in-flight call; the fix (if any) is upstream.
+    ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
+    # A dependency refused the call; whether the user lacks access there or
+    # the service lost its auth context is decided upstream, not here.
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorCategory.UPSTREAM,
+    # A stale reference: the cursor row was deleted (often by the same user
+    # in another client) between two page fetches.
+    ErrorCode.STALE_CURSOR: ErrorCategory.USER,
 }
 
 
@@ -291,16 +392,24 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorImpact.BLOCKING,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
-    # Self-healing: a session state that resumes on reconnect, and a routing
-    # artifact the client re-addresses. No progress is lost.
+    ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
+    # Self-healing: a session state that resumes on reconnect, a routing
+    # artifact the client re-addresses, and an upstream cancellation a retry
+    # outlives. No progress is lost.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorImpact.TRANSIENT,
+    ErrorCode.HOST_OFFLINE: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
+    ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorImpact.BENIGN,
     ErrorCode.NOT_FOUND: ErrorImpact.BENIGN,
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
+    ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
 
@@ -329,11 +438,20 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
+    # Context-driven: a backing call can be cancelled or denied while serving
+    # any stage.
+    ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
+    ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
 }
 
 
@@ -423,6 +541,77 @@ class OmnigentError(Exception):
         return self._phase_override or phase_for_code(self.code)
 
 
+class StaleCursorError(OmnigentError):
+    """A pagination cursor row no longer exists.
+
+    Cursor pagination resolves the ``after``/``before`` id to that row's sort
+    position at read time. When the row was deleted between two page fetches
+    the position is unknowable, and an empty page would be indistinguishable
+    from a completed enumeration — silent truncation. Raising instead makes
+    the outcome distinguishable: HTTP clients get a 400 with the
+    ``stale_cursor`` code and restart their enumeration; in-process
+    enumeration loops restart via :func:`restart_on_stale_cursor`.
+
+    :param cursor_id: The id the cursor referenced, e.g. ``"conv_abc123"``.
+    """
+
+    def __init__(self, cursor_id: str) -> None:
+        super().__init__(
+            f"pagination cursor {cursor_id!r} no longer exists; "
+            "restart the enumeration without it",
+            code=ErrorCode.STALE_CURSOR,
+        )
+        self.cursor_id = cursor_id
+
+
+# Full-enumeration attempts before a persistently stale cursor propagates.
+_STALE_CURSOR_ATTEMPTS = 3
+
+
+def restart_on_stale_cursor(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    """Restart a full cursor enumeration when its cursor row vanishes.
+
+    For in-process loops that page a store to completion (``while has_more:
+    after = last_id``), a concurrent delete of the cursor row makes the walk
+    fail loudly (:class:`StaleCursorError`) rather than end early on a
+    silently truncated result. Decorating the whole enumeration restarts it
+    from the first page, so local accumulators are rebuilt against a
+    surviving row set instead of double-counting a partial walk. Re-raises
+    after :data:`_STALE_CURSOR_ATTEMPTS` attempts (rows are being deleted
+    faster than the walk can finish).
+
+    Works on coroutine functions too: an ``async def`` walk is awaited
+    inside the retry loop, so decorating one restarts it rather than
+    handing back a coroutine the loop never gets to see fail.
+
+    :param fn: A function that runs one complete enumeration per call.
+    :returns: The wrapped function.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+            for _ in range(_STALE_CURSOR_ATTEMPTS - 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except StaleCursorError:
+                    continue
+            return await fn(*args, **kwargs)
+
+        return cast(Callable[_P, _T], async_wrapper)
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        for _ in range(_STALE_CURSOR_ATTEMPTS - 1):
+            try:
+                return fn(*args, **kwargs)
+            except StaleCursorError:
+                continue
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
 class ElicitationDeclinedError(Exception):
     """Raised when a user explicitly declines an elicitation (action == "decline").
 
@@ -464,6 +653,58 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+def _rpc_error_status_name(exc: BaseException) -> str | None:
+    """Return the gRPC status name a failed call carries, or ``None``.
+
+    Matched structurally — an ``RpcError`` ancestor by class name plus a
+    callable ``code()`` returning a status object with a ``name`` — so a
+    vendored copy of grpc (a different class identity than pypi grpcio) still
+    matches and this module imports no grpc.
+
+    :param exc: The exception to inspect.
+    :returns: The status name (e.g. ``"CANCELLED"``), or ``None`` when *exc*
+        is not an RPC error or its status is unreadable.
+    """
+    if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
+        return None
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return None
+    try:
+        status = code()
+    except Exception:  # noqa: BLE001 — a status reader that itself fails carries no status
+        return None
+    name = getattr(status, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def is_cancelled_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for a peer-cancelled RPC error (matched
+        structurally, see :func:`_rpc_error_status_name`).
+    """
+    return _rpc_error_status_name(exc) == "CANCELLED"
+
+
+def is_permission_denied_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call refused with ``PERMISSION_DENIED``.
+
+    E.g. an upstream service answering HTTP 403 through a gRPC channel proxy
+    (``details = "Received http2 header with status: 403"``).
+
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for a permission-denied RPC error (matched
+        structurally, see :func:`_rpc_error_status_name`).
+    """
+    return _rpc_error_status_name(exc) == "PERMISSION_DENIED"
+
+
+# EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.
+_DISK_FULL_ERRNOS = frozenset({errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)})
+
+
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """Best-effort (category, impact) for any logged exception.
 
@@ -474,6 +715,13 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     - :class:`OmnigentError` (and its subclasses) keep their own axes.
     - Transport failures (connection/timeout, plus httpx / WebSocket disconnects
       matched by type name) read as a transient upstream blip.
+    - A peer-cancelled gRPC call (see :func:`is_cancelled_rpc_error`) reads the
+      same way: the dependency tore down the in-flight call, not our fault.
+    - A permission-denied gRPC call (see :func:`is_permission_denied_rpc_error`)
+      is upstream-owned too, but benign rather than transient: the dependency
+      refused one call, and a bare retry does not self-heal a denial.
+    - A full disk or exhausted quota (``ENOSPC`` / ``EDQUOT``) is the host
+      machine's fault and blocks whatever tried to write.
     - Anything else is genuinely unattributed: UNKNOWN on both axes rather than a
       guessed owner. The turn's terminal outcome remains the authoritative
       blocking signal.
@@ -483,6 +731,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     """
     if isinstance(exc, OmnigentError):
         return exc.category, exc.impact
+    if isinstance(exc, OSError) and exc.errno in _DISK_FULL_ERRNOS:
+        return ErrorCategory.HOST, ErrorImpact.BLOCKING
     # ConnectionError/TimeoutError are OSError subclasses: this also catches an
     # internal asyncio timeout on a slow server-side call (really ours) as
     # upstream. Same best-effort trade-off as the name set below.
@@ -490,4 +740,8 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     if _TRANSPORT_EXC_NAMES.intersection(klass.__name__ for klass in type(exc).__mro__):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
+    if is_cancelled_rpc_error(exc):
+        return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
+    if is_permission_denied_rpc_error(exc):
+        return ErrorCategory.UPSTREAM, ErrorImpact.BENIGN
     return ErrorCategory.UNKNOWN, ErrorImpact.UNKNOWN

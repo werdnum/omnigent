@@ -2,6 +2,7 @@ import {
   forwardRef,
   useLayoutEffect,
   useRef,
+  useState,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
@@ -10,12 +11,40 @@ import {
 } from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
+import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  isComposerSteerAllKey,
+} from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+
+/**
+ * The composer layout contract: one 12px inset, two roles.
+ *
+ * Inside the card, every content row - the input text, chip rows
+ * (attachment/mention chips), feedback rows (attachment/command errors), and
+ * the action row's controls - aligns to a shared left/right inset line 12px
+ * from the card's edges. Outside the card, the docked trays (workspace bar,
+ * queued-messages strip, sub-agent tray) nest 12px in from the card's outer
+ * edges: a tray is a shelf peeking above the card, not a content row, so it
+ * keeps its own inset rather than sharing the card's border box.
+ *
+ * Padding vs margin follows what each row's border box must coincide with:
+ * chip and action rows are measured through their children (chips, buttons),
+ * so they pad; a feedback row's own box sits on the inset line, so it uses
+ * margins. Vertical rhythm: the input area is `pt-3 pb-1`, each content row
+ * carries `pb-2`, and the action row is `pt-1 pb-2`.
+ */
+export const COMPOSER_CONTENT_INSET_CLASS = "px-3";
+export const COMPOSER_BLOCK_INSET_CLASS = "mx-3";
+export const COMPOSER_TRAY_INSET_CLASS = "mx-3";
 
 /**
  * Minimum free space (px) the action row keeps between its leading and
@@ -39,9 +68,13 @@ export const COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS =
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;
   shouldPreferSendOverCompletion: boolean;
+  shouldSteerAllFromKeyboard: boolean;
 }
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+  appearance?: "default" | "glass";
+  /** Attachments, mentions, or feedback that need the expanded mobile layout. */
+  hasContent?: boolean;
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
@@ -69,35 +102,89 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
 }
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
-  { className, input, keyboard, slots, actions, ...props },
+  {
+    appearance = "default",
+    hasContent = false,
+    className,
+    input,
+    keyboard,
+    slots,
+    actions,
+    onFocusCapture,
+    onBlurCapture,
+    ...props
+  },
   ref,
 ) {
+  const isMobile = useIsMobileViewport();
+  const [focusWithin, setFocusWithin] = useState(false);
+  const [uncontrolledValue, setUncontrolledValue] = useState(input.defaultValue ?? "");
+  const expanded =
+    focusWithin ||
+    hasContent ||
+    Boolean(slots?.inputPrefix) ||
+    String(input.value ?? uncontrolledValue).length > 0;
+  const needsHintPlaceholder = input.placeholder === "" && Boolean(slots?.inputHint);
   const actionRowRef = useRef<HTMLDivElement>(null);
   const actionWidthRef = useRef<HTMLDivElement>(null);
   const leadingRef = useRef<HTMLDivElement>(null);
   const trailingRef = useRef<HTMLDivElement>(null);
-  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef);
+  useCollapsedComposerLabels(actionRowRef, actionWidthRef, leadingRef, trailingRef, isMobile);
   return (
     <div
       ref={ref}
       data-composer-card
+      data-mobile-composer={isMobile ? (expanded ? "expanded" : "collapsed") : undefined}
+      data-composer-hint-placeholder={needsHintPlaceholder || undefined}
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
+        "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
+        appearance === "glass"
+          ? "isolate rounded-[20px] border-0 bg-transparent"
+          : "composer-reference-surface border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
         className,
       )}
       {...props}
+      onFocusCapture={(event) => {
+        // Header controls bubble through React portals outside this card.
+        if (
+          event.currentTarget.contains(event.target) &&
+          !event.target.closest('[data-composer-action="add"]')
+        ) {
+          setFocusWithin(true);
+        }
+        onFocusCapture?.(event);
+      }}
+      onBlurCapture={(event) => {
+        if (event.currentTarget.contains(event.target)) {
+          setFocusWithin(event.currentTarget.contains(event.relatedTarget));
+        }
+        onBlurCapture?.(event);
+      }}
     >
+      {appearance === "glass" && <OmniGlassSurface borderRadius={20} className="-z-10" />}
       {slots?.beforeInput}
       <ComposerInputArea
+        data-composer-input-area
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}
       >
         {slots?.inputPrefix}
         {slots?.inputBackdrop}
-        <ComposerTextInput input={input} keyboard={keyboard} />
+        <ComposerTextInput
+          input={{
+            ...input,
+            rows: input.rows ?? (isMobile ? 1 : undefined),
+            placeholder: isMobile && needsHintPlaceholder ? input["aria-label"] : input.placeholder,
+            onChange: (event) => {
+              if (input.value === undefined) setUncontrolledValue(event.currentTarget.value);
+              input.onChange?.(event);
+            },
+          }}
+          keyboard={keyboard}
+        />
         {slots?.inputHint}
       </ComposerInputArea>
       {slots?.attachments}
-      <ComposerActionRow ref={actionRowRef} data-testid={actions.testId}>
+      <ComposerActionRow ref={actionRowRef} data-composer-actions data-testid={actions.testId}>
         {/* Zero-height width probe: resize-observed instead of the row itself,
             whose height the collapse verdict can change. */}
         <div ref={actionWidthRef} className="absolute inset-x-0 top-0 h-0" />
@@ -130,6 +217,7 @@ function useCollapsedComposerLabels(
   widthRef: RefObject<HTMLDivElement | null>,
   leadingRef: RefObject<HTMLDivElement | null>,
   trailingRef: RefObject<HTMLDivElement | null>,
+  isMobile: boolean,
 ) {
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -144,21 +232,33 @@ function useCollapsedComposerLabels(
       // Not laid out yet (hidden, or jsdom): keep the current verdict.
       if (!(available > 0)) return;
       delete row.dataset.labels;
+      const previousWrap = leading.style.flexWrap;
+      leading.style.flexWrap = "nowrap";
       const gap = Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX);
       if (leading.scrollWidth + trailing.scrollWidth + gap > available)
         row.dataset.labels = "collapsed";
+      leading.style.flexWrap = previousWrap;
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
     const resizeObserver = new ResizeObserver(measure);
     resizeObserver.observe(width);
+    resizeObserver.observe(leading);
+    resizeObserver.observe(trailing);
     const mutationObserver = new MutationObserver(measure);
-    mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
+    // Portaled controls can change appearance without resizing their collapsed groups.
+    mutationObserver.observe(row, {
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class"],
+      subtree: true,
+    });
     return () => {
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [rowRef, widthRef, leadingRef, trailingRef]);
+  }, [rowRef, widthRef, leadingRef, trailingRef, isMobile]);
 }
 
 /**
@@ -213,8 +313,30 @@ export function ComposerTextInput({
     <ComposerTextarea
       {...input}
       onKeyDown={(event) => {
+        // A newline in every mode and on touch devices; completion menus never see it.
+        if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, "\n");
+          return;
+        }
         if (keyboard.preventsKeyboardSubmit && event.key === "Enter") return;
+        const insertNewline =
+          event.key === "Enter" &&
+          (event.shiftKey || keyboard.submitWithModEnter) &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey;
+        const listEdit = insertNewline ? composerListEdit(event.currentTarget) : null;
+        const listStartEdit =
+          event.key === " " && !event.altKey && !event.shiftKey && !event.metaKey && !event.ctrlKey
+            ? composerListStartEdit(event.currentTarget)
+            : null;
         const shouldSubmitFromKeyboard = isComposerSendKey(
+          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
+        const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
           { ...event, isComposing: event.nativeEvent.isComposing },
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
@@ -222,17 +344,103 @@ export function ComposerTextInput({
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+          shouldSteerAllFromKeyboard,
         });
+        if (event.defaultPrevented) return;
+        const edit = listStartEdit ?? listEdit;
+        if (edit) {
+          event.preventDefault();
+          insertComposerText(event.currentTarget, edit.text, edit.start, edit.end);
+        }
       }}
     />
   );
+}
+
+function composerListStartEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  if (selectionStart !== selectionEnd) return null;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*]|\d+[.)])$/);
+  if (!match) return null;
+  const [, indent, marker] = match;
+  return {
+    start: lineStart,
+    end: selectionStart,
+    text: `${indent || "  "}${marker} `,
+  };
+}
+
+function composerListEdit(textarea: HTMLTextAreaElement) {
+  const { value, selectionStart, selectionEnd } = textarea;
+  const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
+  const lineEndIndex = value.indexOf("\n", selectionEnd);
+  const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
+  const prefix = value.slice(lineStart, selectionStart);
+  const match = prefix.match(/^([ \t]*)([-*•]|\d+[.)])([ \t]+)(.*)$/);
+  if (!match) return null;
+  const [, indent, marker, spacing, content] = match;
+  const suffix = value.slice(selectionEnd, lineEnd);
+  if (selectionStart === selectionEnd && !content.trim() && !suffix.trim()) {
+    return { start: lineStart, end: lineEnd, text: "" };
+  }
+  // Keep the typed bullet so the draft stays valid Markdown.
+  const nextMarker = /^\d/.test(marker)
+    ? `${Number.parseInt(marker, 10) + 1}${marker.at(-1)}`
+    : marker;
+  return { start: selectionStart, end: selectionEnd, text: `\n${indent}${nextMarker}${spacing}` };
 }
 
 export function ComposerInputArea({ className, ...props }: ComponentPropsWithoutRef<"div">) {
   return (
     <div
       className={cn(
-        "composer-input-text relative overflow-hidden px-3 pt-3 pb-1 text-ui",
+        "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One wrapping row of chips (attachment tiles, mention chips) on the shared
+ * inset line. Chips are measured through their own boxes, so the row pads
+ * rather than margins; the chip type picks its gap via ``className``.
+ * Past three tile rows the row scrolls, so many chips cannot push the input
+ * and Send off screen; ``-mt-1 pt-1`` keeps corner remove buttons unclipped.
+ */
+export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  return (
+    <div
+      className={cn(
+        "-mt-1 flex max-h-[208px] flex-wrap items-start gap-2 overflow-y-auto pt-1 pb-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One feedback line under the input (rejected attachments, slash-command
+ * errors and /help output). The row's own border box sits on the shared
+ * inset line, so it margins rather than pads.
+ */
+export function ComposerFeedbackRow({
+  tone = "muted",
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { tone?: "muted" | "error" }) {
+  return (
+    <div
+      className={cn(
+        "pb-2 text-sm whitespace-pre-wrap",
+        COMPOSER_BLOCK_INSET_CLASS,
+        tone === "error" ? "text-destructive" : "text-muted-foreground",
         className,
       )}
       {...props}
@@ -277,7 +485,8 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+          "group/composer-actions relative flex min-w-0 flex-nowrap mobile-app:flex-wrap items-center justify-between gap-2 pt-1 pb-2",
+          COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
         {...props}
@@ -293,9 +502,12 @@ export const ComposerActionGroup = forwardRef<
   return (
     <div
       ref={ref}
+      data-composer-action-group={side}
       className={cn(
-        "flex min-w-0 items-center gap-1",
-        side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+        "flex min-w-0 items-center gap-1 mobile-app:max-w-full",
+        side === "left"
+          ? "flex-none overflow-visible mobile-app:flex-wrap mobile-app:shrink"
+          : "ml-auto max-w-full shrink",
         className,
       )}
       {...props}
@@ -321,13 +533,14 @@ export const ComposerSendButton = forwardRef<
       size="icon"
       variant={interrupt ? "destructive" : "default"}
       className={cn(
-        "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
+        "size-8 mobile-touch-target shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
-          "bg-foreground hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+          "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}
       aria-busy={busy}
+      data-composer-action="send"
       {...props}
     >
       {busy ? (

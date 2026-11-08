@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Typed client for the four `/v1/sessions` endpoints introduced in
 // commit `e64a490` ("Migrate session ↔ client interactions to
 // /v1/sessions"). Mirrors `omnigent/server/routes/sessions.py`.
@@ -11,11 +12,12 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
+import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost } from "./sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
@@ -23,13 +25,13 @@ import type {
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
+  PendingInput,
   SandboxStatus,
   Session,
   SessionEventInput,
+  SessionFamily,
   SessionItem,
   SessionStatus,
-  SkillsStatus,
-  SkillSummary,
 } from "./types";
 
 /** Returns the client surface label for the X-Omnigent-Client telemetry header. */
@@ -82,6 +84,8 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /** The session a claude-sdk `clear` continued in; absent for other events. */
+  sessionId?: string;
 }
 
 /**
@@ -105,6 +109,8 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  family?: SessionFamily | null;
+  sandbox_profile?: SandboxProfile | null;
   id: string;
   agent_id: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
@@ -118,6 +124,8 @@ interface SessionResponseWire {
    * other carrier and it's absent for those.
    */
   host_id?: string | null;
+  runner_online?: boolean | null;
+  host_online?: boolean | null;
   /**
    * Whether this session is bound to a dormant managed host the server can
    * wake in place (its sandbox provider supports resume). Read only when the
@@ -152,6 +160,11 @@ interface SessionResponseWire {
    */
   title?: string | null;
   labels?: Record<string, string>;
+  project_id?: string | null;
+  /** The session whose Workspace rail lists this one as a side chat. */
+  side_chat_parent_id?: string | null;
+  /** Whether the viewer may start side chats here; absent from older servers. */
+  side_chat_allowed?: boolean | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -172,6 +185,8 @@ interface SessionResponseWire {
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
   model_override?: string | null;
+  inference_configured?: boolean;
+  inference_error?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
@@ -180,6 +195,7 @@ interface SessionResponseWire {
   share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
+  usage_included?: boolean;
   total_cost_usd?: number | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
@@ -190,9 +206,12 @@ interface SessionResponseWire {
   last_task_error?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event dicts at the
@@ -209,11 +228,12 @@ interface SessionResponseWire {
    * client that posted then navigated away / rebound re-hydrates the
    * optimistic bubble. Empty for non-native sessions.
    */
-  pending_inputs?: {
-    pending_id: string;
-    content: MessageContentBlock[];
-    created_by?: string;
-  }[];
+  pending_inputs?: PendingInputWire[];
+  /**
+   * Saved startup messages that were never delivered, same shape as
+   * ``pending_inputs``. Absent on servers that predate it.
+   */
+  failed_inputs?: PendingInputWire[];
   /**
    * Numeric permission level (1=read, 2=edit, 3=manage, 4=owner) the
    * authenticated user holds on this session. Optional on the wire
@@ -240,15 +260,9 @@ interface SessionResponseWire {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent can invoke — bundled + host-discovered
-   * (subject to the spec's ``skills_filter``). Just name + one-line
-   * description. Surfaced in the web composer's slash-command menu.
-   */
-  skills?: SkillSummary[];
-  skills_status?: SkillsStatus;
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
+  side_chat_settings_supported?: boolean;
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -313,16 +327,35 @@ function usageByModelFromWire(
   return out;
 }
 
+interface PendingInputWire {
+  pending_id: string;
+  content: MessageContentBlock[];
+  created_by?: string;
+}
+
+function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInput[] {
+  return (wire ?? []).map((p) => ({
+    pendingId: p.pending_id,
+    content: p.content,
+    ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
+  }));
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
-  // attach) can pin to the replica holding that host's runner tunnel.
-  setSessionHost(wire.id, wire.host_id);
+  // attach) can pin to the replica holding that host's runner tunnel; a
+  // sub-agent child inherits its parent's through the recorded parent link.
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
+  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
+    family: wire.family,
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
+    runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
+    hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,
@@ -331,6 +364,9 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
+    projectId: wire.project_id ?? null,
+    sideChatParentId: wire.side_chat_parent_id ?? null,
+    sideChatAllowed: wire.side_chat_allowed ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
@@ -345,25 +381,29 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
+    usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
-    pendingInputs: (wire.pending_inputs ?? []).map((p) => ({
-      pendingId: p.pending_id,
-      content: p.content,
-      ...(p.created_by !== undefined ? { createdBy: p.created_by } : {}),
-    })),
+    pendingInputs: pendingInputsFromWire(wire.pending_inputs),
+    failedInputs: pendingInputsFromWire(wire.failed_inputs),
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
-    skills: wire.skills ?? [],
-    skillsStatus: wire.skills_status,
     codexModelOptions: wire.model_options ?? [],
+    sideChatSettingsSupported: wire.side_chat_settings_supported === true,
+    ...(wire.inference_configured !== undefined
+      ? {
+          inferenceConfigured: wire.inference_configured,
+          inferenceError: wire.inference_error ?? null,
+        }
+      : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    sandboxProfile: wire.sandbox_profile ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -388,12 +428,42 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
-  constructor(message: string, status: number, code: string | null) {
+  /** The response's `Retry-After`, in milliseconds, when it sent one. */
+  readonly retryAfterMs: number | null;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    retryAfterMs: number | null = null,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+const IMF_FIXDATE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * Parse a `Retry-After` header, either delta-seconds or an HTTP date.
+ *
+ * @param value - The header value, or `null` when absent.
+ * @param now - Clock for the HTTP-date form.
+ * @returns Milliseconds to wait, or `null` when absent or malformed.
+ */
+export function parseRetryAfterMs(value: string | null, now: number = Date.now()): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1_000;
+  // Only IMF-fixdate, the form RFC 9110 requires senders to use. Date.parse
+  // accepts far more ("-1", "Mon 1", "January 1, 2027"), and a misread hint
+  // would skip or stretch the backoff; anything else falls back to it.
+  if (!IMF_FIXDATE.test(trimmed)) return null;
+  const date = Date.parse(trimmed);
+  return Number.isNaN(date) ? null : Math.max(0, date - now);
 }
 
 /**
@@ -432,7 +502,9 @@ export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
-  return new ApiError(message, res.status, code);
+  // `headers` is optional on hand-built Response stand-ins.
+  const retryAfterMs = parseRetryAfterMs(res.headers?.get("Retry-After") ?? null);
+  return new ApiError(message, res.status, code, retryAfterMs);
 }
 
 function postEventResponseFromWire(wire: {
@@ -442,6 +514,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  session_id?: string;
 }): PostEventResponse {
   return {
     queued: wire.queued,
@@ -450,6 +523,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    sessionId: wire.session_id,
   };
 }
 
@@ -533,12 +607,31 @@ export interface ImportedSessionRef {
   title: string | null;
 }
 
+/** One session that could not be imported, with a user-facing reason. */
+export interface ImportFailureRef {
+  /** null when the failing session's id wasn't known (host reported a count only). */
+  externalSessionId: string | null;
+  source: string | null;
+  reason: string;
+}
+
 /** Result of a batch local import (`POST /v1/imports/local`). */
 export interface LocalImportResult {
   imported: number;
   alreadyImported: number;
   failed: number;
   sessions: ImportedSessionRef[];
+  /** One entry per failed session, with a reason; length equals `failed`. */
+  failures: ImportFailureRef[];
+}
+
+/** Map one `failed`/`failures[]` wire record to an {@link ImportFailureRef}. */
+function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
+  return {
+    externalSessionId: typeof evt.external_session_id === "string" ? evt.external_session_id : null,
+    source: typeof evt.source === "string" ? evt.source : null,
+    reason: typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+  };
 }
 
 /**
@@ -583,6 +676,7 @@ export async function importLocalSessions(
   if (res.body === null) throw new Error("Import failed: no response stream.");
 
   const sessions: ImportedSessionRef[] = [];
+  const failures: ImportFailureRef[] = [];
   let imported = 0;
   let alreadyImported = 0;
   let failed = 0;
@@ -604,10 +698,12 @@ export async function importLocalSessions(
       };
       sessions.push(ref);
       onSession?.(ref);
+    } else if (evt.event === "failed") {
+      failures.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
       imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
       alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
-      failed = typeof evt.failed === "number" ? evt.failed : 0;
+      failed = typeof evt.failed === "number" ? evt.failed : failures.length;
     } else if (evt.event === "error") {
       errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
     }
@@ -638,7 +734,7 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
-  return { imported, alreadyImported, failed, sessions };
+  return { imported, alreadyImported, failed, sessions, failures };
 }
 
 /**
@@ -663,6 +759,11 @@ async function importLocalSessionsBuffered(
     already_imported: number;
     failed: number;
     sessions: { session_id: string; title: string | null }[];
+    failures?: {
+      external_session_id: string | null;
+      source: string | null;
+      reason: string;
+    }[];
   }>(res);
   const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
   for (const s of sessions) onSession?.(s);
@@ -671,6 +772,13 @@ async function importLocalSessionsBuffered(
     alreadyImported: wire.already_imported,
     failed: wire.failed,
     sessions,
+    // Absent from a server predating failure detail (only a count); default to
+    // none so the caller can still render the tally.
+    failures: (wire.failures ?? []).map((f) => ({
+      externalSessionId: f.external_session_id,
+      source: f.source,
+      reason: f.reason,
+    })),
   };
 }
 
@@ -688,23 +796,33 @@ async function importLocalSessionsBuffered(
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
- * @returns The created session's id.
+ * @returns The created session's id, and the id of the session-scoped agent
+ *   created from the bundle.
  */
 export async function createBundledSession(
   bundle: File,
   metadata: {
     host_id?: string;
     host_type?: string;
-    workspace?: string;
+    workspace?: string | null;
+    workspaces?: string[];
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     project_id?: string;
+    sibling_source_id?: string;
     labels?: Record<string, string>;
+    initial_input?: SessionEventInput;
     terminal_launch_args?: string[];
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean } | null;
+    mcp_registry_services?: string[];
   } = {},
-): Promise<{ id: string }> {
+  initialFiles: File[] = [],
+): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
+  for (const file of initialFiles) form.append("initial_files", file, file.name);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {
@@ -722,8 +840,9 @@ export async function createBundledSession(
   // so callers don't need to care which path was taken.
   const body = (await res.json()) as {
     session_id: string;
+    agent_id?: string;
   };
-  return { id: body.session_id };
+  return { id: body.session_id, agentId: body.agent_id };
 }
 
 /**
@@ -740,7 +859,7 @@ export async function createBundledSession(
  *
  * @param sourceId - Session to fork, e.g. "conv_abc123".
  * @param options.title - Optional title for the new fork.
- * @param options.agentId - Optional built-in agent to switch the fork to
+ * @param options.agentId - Optional agent to switch the fork to
  *   (e.g. fork a Claude-SDK session into Claude Code). Omitted → keep the
  *   source's agent. The server carries model settings (and native
  *   history) across only within the same provider family.
@@ -763,8 +882,11 @@ export async function createBundledSession(
  *   `provider` names one of the server's configured sandbox providers
  *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
  *   repository the server clones into the sandbox; `null` gives the fork an
- *   empty sandbox, and leaving the key off inherits the repository the
- *   source session recorded.
+ *   empty sandbox. `workspaces` selects several repositories on providers
+ *   that support them; `[]` or `null` clears the selection. Send either
+ *   `workspace` or `workspaces`; omitting both inherits every source repo.
+ *   `hostId` names the new sandbox host, as on a managed create; omitted,
+ *   the server mints one.
  */
 export async function forkSession(
   sourceId: string,
@@ -774,26 +896,44 @@ export async function forkSession(
     upToResponseId?: string;
     config?: {
       modelOverride?: string;
-      reasoningEffort?: string;
+      reasoningEffort?: string | null;
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null };
+    sandbox?: {
+      provider?: string | null;
+      hostId?: string;
+      profileId?: string;
+      profileRevision?: string;
+    } & (
+      | { workspace?: string | null; workspaces?: never }
+      | { workspace?: never; workspaces?: string[] | null }
+    );
+    /** Mark the fork as a side chat (hidden from the left sidebar). */
+    sideChat?: boolean;
   } = {},
 ): Promise<Session> {
-  const { title, agentId, upToResponseId, config, sandbox } = options;
+  const { title, agentId, upToResponseId, config, sandbox, sideChat } = options;
   const body: {
     title?: string;
     agent_id?: string;
     up_to_response_id?: string;
     model_override?: string;
-    reasoning_effort?: string;
+    reasoning_effort?: string | null;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
+    host_id?: string;
     workspace?: string | null;
+    workspaces?: string[] | null;
+    side_chat?: boolean;
   } = {};
+  if (sideChat) {
+    body.side_chat = true;
+  }
   if (title !== undefined) {
     body.title = title;
   }
@@ -823,10 +963,20 @@ export async function forkSession(
     if (sandbox.provider != null) {
       body.sandbox_provider = sandbox.provider;
     }
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
+    }
     // Key presence is the signal here: an explicit null means "empty
     // sandbox", while omitting it inherits the source's repository.
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
+    }
+    if (sandbox.workspaces !== undefined) {
+      body.workspaces = sandbox.workspaces;
+    }
+    if (sandbox.hostId !== undefined) {
+      body.host_id = sandbox.hostId;
     }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
@@ -838,32 +988,46 @@ export async function forkSession(
 }
 
 /**
- * Switch an existing session in place to a different agent/harness:
- * ``POST /v1/sessions/{id}/switch-agent``.
+ * Fork a generic side chat in the parent's current working directory.
+ * Reuse the parent's live runner, relaunching the parent first if it has
+ * stopped. In-process sessions use normal server dispatch. Codex uses its
+ * native `/side` fork instead.
  *
- * Unlike fork, this keeps the SAME session (transcript, comments, files,
- * workspace) and only rebinds the agent. The next turn runs on the new
- * harness; history carries per the same rule as a fork switch
- * (``forkTargetCarriesHistory``). Model settings reset to the target's
- * defaults on a cross-family switch. Only built-in agents are bindable,
- * and only while the session is idle (a running turn → 409).
+ * Like native Codex side chats, these share the parent's workspace. A saved
+ * branch may belong to a previous host and must not be required to send.
  *
- * @param sessionId - The session to switch, e.g. ``"conv_abc123"``.
- * @param agentId - Built-in agent to switch to, e.g. ``"ag_builtin_codex"``.
- * @returns The session as it stands after the switch.
- * @throws Error carrying the server's failure detail (e.g. 409 when a turn
- *   is running) so the caller can surface it inline.
+ * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
+ * @returns The new side-chat session id.
+ * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
-export async function switchSessionAgent(sessionId: string, agentId: string): Promise<Session> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/switch-agent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId }),
-    },
-  );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+export async function createSideChat(
+  sourceId: string,
+  settings?: SideChatModelSettings,
+): Promise<{ childSessionId: string }> {
+  let source = await getSession(sourceId);
+  if (
+    source.runnerOnline === false &&
+    source.hostId != null &&
+    (source.hostOnline !== false || source.hostResumable)
+  ) {
+    await retrySession(sourceId);
+    source = await getSession(sourceId);
+  }
+  const { runnerId } = source;
+  const canUseRunner =
+    source.runnerOnline !== false && (runnerId != null || source.runnerOnline === true);
+  if (!canUseRunner) {
+    throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
+  }
+  const fork = await forkSession(sourceId, {
+    title: "Side chat",
+    sideChat: true,
+    config: settings,
+  });
+  if (runnerId) {
+    await updateSession(fork.id, { runnerId });
+  }
+  return { childSessionId: fork.id };
 }
 
 /**
@@ -955,11 +1119,9 @@ export async function launchRunner(
  * clear signal. Clearing sub-agent routing lands the session on Default,
  * the same place ``"off"`` does.
  *
- * `silent: true` persists without firing the claude-native tmux
- * forward — use for bind-time auto-apply (e.g. the sticky-pref
- * handoff in `bindStream`) where injecting a visible "/model X"
- * item into a fresh pane would look like an unexpected first
- * message in the chat.
+ * `silent: true` persists without forwarding a live command into a native
+ * harness. Use it only for persistence-only updates, such as detaching a
+ * runner while clearing its model override.
  */
 export async function updateSession(
   sessionId: string,
@@ -1092,19 +1254,35 @@ export async function getSession(sessionId: string): Promise<Session> {
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+export interface SessionRepositoryBranch {
+  url: string;
+  branch: string | null;
+  /** Whether this branch exists on the clone remote; null when it cannot be checked. */
+  pushed: boolean | null;
+}
+
+export async function fetchSessionRepositoryBranches(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<{ repositories: SessionRepositoryBranch[] }> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/repository-branches`,
+    { signal },
+  );
+  return readJsonOrThrow(res);
+}
+
 /**
- * Snapshot a session WITHOUT its committed items or liveness fields.
+ * Snapshot a session without committed items, liveness, or subtree usage.
  *
  * Use this (not `getSession`) when the caller hydrates the transcript
  * via `fetchSessionItemsPage` and reads liveness from the /health poll +
- * WS stream — i.e. the chat surface's snapshot consumers. The skipped
- * reads are the two most expensive steps of the server's snapshot build
- * (the 100-item history read and the runner/host liveness lookup), so
- * this is the fast path for open/switch. The returned `Session` has
- * `items: []`; callers that need the snapshot's own items (or
- * `runner_online`/`host_online` once the wire type carries them) must
- * use `getSession` instead. Older servers ignore the params and return
- * the full snapshot — both shapes parse identically.
+ * WS stream — i.e. the chat surface's snapshot consumers. Subtree usage
+ * is fetched separately with `getSessionUsage`, so a large spawn tree
+ * cannot delay opening the conversation. The returned `Session` has
+ * `items: []` and `usageIncluded: false`; callers needing a full snapshot
+ * use `getSession`. Older servers ignore the params, include usage, and
+ * need no separate usage request.
  *
  * NOTE: keep all consumers of a given react-query key (`["session", id]`)
  * on the SAME variant — mixing full and slim under one key would let a
@@ -1128,6 +1306,7 @@ export async function getSessionSlim(
   const params = new URLSearchParams({
     include_items: "false",
     include_liveness: "false",
+    include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
@@ -1135,6 +1314,61 @@ export async function getSessionSlim(
     { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+export interface SessionSignInLink {
+  pending: boolean;
+  url: string | null;
+  code: string | null;
+}
+
+/**
+ * Ask the session's host for the sign-in prompt its terminal shows right now.
+ *
+ * A link saved in an error card is bound to the launcher process that printed
+ * it and goes stale once that process moves on, so the card asks at click time.
+ */
+export async function getSessionSignInLink(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionSignInLink> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/sign-in-link`,
+    { signal: options.signal },
+  );
+  return readJsonOrThrow<SessionSignInLink>(res);
+}
+
+export interface SessionUsageSnapshot {
+  id: string;
+  totalCostUsd: number | null;
+  usageByModel: Record<string, ModelUsage> | null;
+}
+
+/** Read usage outside the shared metadata query; ignore unrelated snapshot fields. */
+export async function getSessionUsage(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionUsageSnapshot> {
+  const params = new URLSearchParams({
+    include_usage: "true",
+    include_items: "false",
+    include_liveness: "false",
+    refresh_state: "false",
+  });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
+  );
+  const wire =
+    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
+      res,
+    );
+  return {
+    id: wire.id,
+    totalCostUsd: wire.total_cost_usd ?? null,
+    usageByModel: usageByModelFromWire(wire.usage_by_model),
+  };
 }
 
 /** One page of a session's committed items, in chronological order. */
@@ -1179,6 +1413,52 @@ export async function fetchSessionItemsPage(
 }
 
 /**
+ * Build a portable JSONL export of a session's transcript.
+ *
+ * Same format as `omnigent session export` (see `session_export` in
+ * `omnigent/cli.py`): the first line is the session metadata
+ * (`record_type: "session_meta"`), every following line is one committed
+ * item (`record_type: "item"`) in chronological order, so the file
+ * round-trips through `omnigent session import`. Records keep the raw
+ * wire shape rather than the SPA's parsed types for that parity.
+ */
+export async function exportSessionTranscript(sessionId: string): Promise<string> {
+  const metaParams = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  const metaRes = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
+  );
+  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
+
+  // Pages are a cursor chain (each request needs the previous last_id),
+  // so the fetches cannot run in parallel.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "500", order: "asc" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
+    const page = await readJsonOrThrow<{
+      data: Record<string, unknown>[];
+      has_more?: boolean;
+      last_id?: string | null;
+    }>(res);
+    for (const item of page.data) {
+      lines.push(JSON.stringify({ record_type: "item", ...item }));
+    }
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return lines.join("\n") + "\n";
+}
+
+/**
  * Items the initial window requests, in one round trip.
  *
  * Opening a session must not keep fetching afterwards: growing the window
@@ -1218,6 +1498,14 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
   return "data" in item && typeof (item as NestedSessionItem).data === "object";
 }
 
+/** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
+export const HOST_OFFLINE_CODE = "host_offline";
+/** A request answered by a sign-in page instead of the API. */
+export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
+
+/** Tells the server this client resends a message once its offline host reconnects. */
+const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
+
 /**
  * Submit a single event to a session. Validated server-side per the
  * `type` discriminator (`message`, `function_call_output`,
@@ -1228,12 +1516,14 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
+  opts?: { holdWhenHostOffline?: boolean },
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...backgroundSessionTitlesRequestHeaders(),
+      ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
     },
     body: JSON.stringify(event),
   });
@@ -1241,16 +1531,27 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-    },
-  );
+  const body = (await res.json().catch((error: unknown): never => {
+    // An auth layer's login page answers the POST with a 200 HTML page: an expired
+    // sign-in, not a malformed reply.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+      throw new ApiError(
+        "Your sign-in expired. Reload the page to sign in again.",
+        401,
+        SIGN_IN_EXPIRED_CODE,
+      );
+    }
+    throw error;
+  })) as {
+    queued: boolean;
+    item_id?: string;
+    denied?: boolean;
+    pending_id?: string;
+    recovered?: boolean;
+    recovery?: PostEventResponse["recovery"];
+    session_id?: string;
+  };
+  return postEventResponseFromWire(body);
 }
 
 /**
@@ -1285,9 +1586,13 @@ export function openSessionStream(
  * `session.interrupted` (transient) and `response.incomplete` (with
  * `incomplete_details.reason == "user_interrupt"`) on the live
  * stream — clients can mark the bubble interrupted from either.
+ * Native side chats include their observed response id to target the exact turn.
  */
-export function interrupt(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "interrupt", data: {} });
+export function interrupt(sessionId: string, responseId?: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "interrupt",
+    data: responseId ? { response_id: responseId } : {},
+  });
 }
 
 /**
@@ -1307,11 +1612,15 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
 }
 
 // Multiple error cards can describe the same failed turn.
-const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+const failedTurnContinuations = new Map<string, Promise<void>>();
 
-/** Continue a rate-limited turn without replaying the original prompt or tools. */
-export function retryRateLimitedTurn(sessionId: string): Promise<void> {
-  const pending = rateLimitedTurnRetries.get(sessionId);
+/**
+ * Continue a turn whose upstream model call failed mid-stream (rate limit,
+ * transient gateway error) without replaying the original prompt or tools —
+ * the runner itself is healthy, only the turn died.
+ */
+export function continueFailedTurn(sessionId: string): Promise<void> {
+  const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
   const retry = postEvent(sessionId, {
@@ -1321,7 +1630,7 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       content: [
         {
           type: "input_text",
-          text: "Please continue from where you left off before the rate limit error.",
+          text: "Please continue from where you left off.",
         },
       ],
     },
@@ -1331,9 +1640,9 @@ export function retryRateLimitedTurn(sessionId: string): Promise<void> {
       if (!result.queued) throw new Error("The retry was not accepted");
     })
     .finally(() => {
-      rateLimitedTurnRetries.delete(sessionId);
+      failedTurnContinuations.delete(sessionId);
     });
-  rateLimitedTurnRetries.set(sessionId, retry);
+  failedTurnContinuations.set(sessionId, retry);
   return retry;
 }
 

@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -13,18 +14,22 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  failedSessionLastError,
+  isComposerReadOnly,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
-  readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -38,13 +43,15 @@ import {
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
-  subAgentComposerLabel,
-  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
+import { subAgentComposerLabel } from "@/shell/subagentLabel";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -52,7 +59,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = isComposerReadOnly(permissionLevel, null, null);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -90,6 +97,17 @@ describe("Composer permission gating", () => {
     expect(state.isReadOnly).toBe(false);
     expect(state.canType).toBe(true);
   });
+
+  it("a structural read-only reason locks the composer at any level", () => {
+    expect(isComposerReadOnly(4, "Mirrored transcript", null)).toBe(true);
+    expect(isComposerReadOnly(null, "Mirrored transcript", null)).toBe(true);
+  });
+
+  it("a temporary send block keeps the level-1 startup fallback editable", () => {
+    // A client-only conversation falls back to level 1 before its session
+    // exists; the send block, not read-only, is what holds submission.
+    expect(isComposerReadOnly(1, null, "Starting the session…")).toBe(false);
+  });
 });
 
 describe("Composer structural read-only reasons", () => {
@@ -108,6 +126,38 @@ describe("Composer structural read-only reasons", () => {
         labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
       }),
     ).toBe("Claude Code sub-agents are read-only");
+  });
+
+  it("gives a sealed codex /side child its own reason, not the generic one", () => {
+    // Server seals a dead side chat with omnigent.closed; the "Side chat"
+    // nickname distinguishes it from an ordinary closed codex sub-agent.
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        },
+        null,
+      ),
+    ).toBe("This side chat has ended and can't receive new messages");
+  });
+
+  it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
+    expect(
+      readOnlyReasonForSessionLabels(
+        {
+          labels: {
+            "omnigent.closed": "true",
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "reviewer",
+          },
+        },
+        null,
+      ),
+    ).toBe("This sub-agent session is closed");
   });
 
   it("returns null for editable sessions without structural labels", () => {
@@ -172,6 +222,23 @@ describe("Terminal-first surface selection", () => {
       }),
     ).toBe(false);
     expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("failedSessionLastError", () => {
+  const error = { code: "runner_failed_to_start", message: "host authentication failed" };
+
+  it("surfaces the error for a failed session", () => {
+    expect(failedSessionLastError({ status: "failed", lastTaskError: error })).toEqual(error);
+  });
+
+  it("hides a stale error on a session that is no longer failed", () => {
+    expect(failedSessionLastError({ status: "running", lastTaskError: error })).toBeNull();
+  });
+
+  it("returns null for a failed session with no error, or no session", () => {
+    expect(failedSessionLastError({ status: "failed" })).toBeNull();
+    expect(failedSessionLastError(null)).toBeNull();
   });
 });
 
@@ -463,6 +530,15 @@ describe("buildPendingBubbles", () => {
       null,
     ) as [Extract<Bubble, { kind: "user" }>];
     expect(replayed.createdAtS).toBeUndefined();
+  });
+
+  it("flags only mid-turn sends as awaiting the agent", () => {
+    const [midTurn, plain] = buildPendingBubbles(
+      [{ ...pending[0]!, sentMidTurn: true }, pending[0]!],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>, Extract<Bubble, { kind: "user" }>];
+    expect(midTurn.awaitingAgent).toBe(true);
+    expect(plain.awaitingAgent).toBeUndefined();
   });
 });
 
@@ -909,6 +985,53 @@ describe("computeShowsWorking", () => {
     );
   });
 
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+  });
+
   it("an in-flight local send lights the indicator before any server edge", () => {
     // Pressing Enter sets chatStore.status = "streaming" synchronously, while
     // `sessionStatus` stays `idle` until the server publishes `running` (for
@@ -927,11 +1050,9 @@ describe("computeShowsWorking", () => {
     ).toBe(true);
   });
 
-  it("a spin-up in flight yields the slot to the Starting-up cue", () => {
-    // ChatPage passes `localSendInFlight: status === "streaming" && !spinUpInFlight`.
-    // `RunnerStartingIndicator` renders only when the shimmer is absent, and its
-    // copy ("Starting up…" / "Cloning repository…") is strictly more informative
-    // than a generic shimmer — so during a boot the optimistic path stands down.
+  it("a managed-sandbox spin-up yields the slot to its stage cue", () => {
+    // ChatPage suppresses the optimistic Working indicator only while a
+    // managed sandbox is reporting a more specific launch stage.
     expect(computeShowsWorking("idle", opts({ localSendInFlight: false }))).toBe(false);
   });
 
@@ -1022,8 +1143,25 @@ describe("shouldShowWorkingIndicator", () => {
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
-  it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
+  it("names what the agent is waiting on beside a chat card that can answer it", () => {
+    expect(workingIndicatorLabel(0, "permission prompt", { answerableInChat: true })).toBe(
+      "Blocked on: permission prompt",
+    );
+  });
+
+  it("says a permission prompt with no chat card needs approval in the terminal", () => {
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe(
+      "Waiting for your approval in the agent's terminal.",
+    );
+    expect(workingIndicatorLabel(0, "permission prompt", { terminalView: true })).toBe(
+      "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+    );
+  });
+
+  it("names other terminal-only block reasons", () => {
+    expect(workingIndicatorLabel(0, "input needed")).toBe(
+      "Waiting for you in the agent's terminal (input needed).",
+    );
   });
 
   it("outranks the rotation", () => {
@@ -1039,6 +1177,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
     // no idea where to respond, so the label must guide them to the terminal.
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
+  });
+
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
   });
 
   it("falls back to the normal label when not parked", () => {
@@ -1129,6 +1281,23 @@ describe("subAgentComposerLabel", () => {
   it("keeps a colon inside the instance-name suffix", () => {
     // Only the first ":" separates tool from name; later colons belong to it.
     expect(subAgentComposerLabel(mkSession({ title: "researcher:auth:v2" }))).toBe("auth:v2");
+  });
+
+  it("shows the Codex nickname label instead of the thread-UUID title suffix", () => {
+    // A Codex /side child titles as "codex-native-ui-subagent:<uuid>"; the tray
+    // must show the friendly nickname, never the raw thread UUID.
+    expect(
+      subAgentComposerLabel(
+        mkSession({
+          title: "codex-native-ui-subagent:01a0a211-5fa2-7922-8b5b-503d8c3dc1a1",
+          subAgentName: "Codex",
+          labels: {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+          },
+        }),
+      ),
+    ).toBe("Side chat");
   });
 
   it("strips the user-added 'ui:' sentinel before taking the suffix", () => {
@@ -1294,16 +1463,71 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
+describe("composer /clear gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["claude-sdk", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)(
+    "offers native /clear for %s when the server lists the control",
+    (harness, offered) => {
+      expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+      expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+      expect(composerOffersClear(harness, "loading")).toBe(false);
+    },
+  );
+
+  it("offers claude-sdk /clear only when the server continues it in a new session", () => {
+    const sdkClear = info({ session_event_types: ["clear"], session_claude_sdk_clear: true });
+    expect(composerOffersClear("claude-sdk", sdkClear)).toBe(true);
+    expect(composerOffersClear("openai-agents", sdkClear)).toBe(false);
+    // An older server lists "clear" for native sessions only.
+    expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
+  });
+});
+
 describe("buildSlashCommandMap", () => {
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw is gated off by default (claude-native only), so it's excluded here.
+    // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /permissions only when showPermissions is true (codex-native)", () => {
+    expect(buildSlashCommandMap([], true, true)["/permissions"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/permissions"
+      ],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/permissions"]);
+  });
+
+  it("includes /side only when showSide is true (codex-native)", () => {
+    // Off by default and when explicitly false — /side is a codex-native
+    // built-in, so it must not leak into other harnesses' menus.
+    expect(buildSlashCommandMap([], true, true)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false)["/side"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/side"],
+    );
+  });
+
+  it("includes /clear only when showClear is true (native terminals)", () => {
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1313,6 +1537,13 @@ describe("buildSlashCommandMap", () => {
     // On when the session is claude-native.
     expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
       BUILTIN_SLASH_COMMANDS["/btw"],
+    );
+  });
+
+  it("includes /mcp only for a started session", () => {
+    expect(buildSlashCommandMap([], true, true)["/mcp"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, true)["/mcp"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/mcp"],
     );
   });
 
@@ -1363,9 +1594,9 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw is gated off by default.
+    // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1487,6 +1718,24 @@ describe("dispatchInitialPrompt", () => {
     // an empty array here means first-message attachments silently vanish.
     expect(send).toHaveBeenCalledWith("what is this?", "ag_abc123", [file]);
   });
+
+  it("dispatches an image-only draft (blank text) through the plain path with its files", () => {
+    // The server-first create path queues { text: "", files: [image] }.
+    // Dispatch must hand the blank text plus the real File objects to
+    // send() — send() omits the input_text block for blank text, so the
+    // first message goes out as input_image blocks alone.
+    const send = vi.fn().mockResolvedValue(undefined);
+    const sendSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    dispatchInitialPrompt(
+      { text: "", skill: null, files: [file] },
+      "ag_abc123",
+      send,
+      sendSlashCommand,
+    );
+    expect(send).toHaveBeenCalledWith("", "ag_abc123", [file]);
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
 });
 
 describe("shouldSendInitialPrompt", () => {
@@ -1496,6 +1745,7 @@ describe("shouldSendInitialPrompt", () => {
   // dropped in the effect, the matching case flips.
   const ready = {
     initialPrompt: "read the README",
+    initialPromptFileCount: 0,
     promptConversationId: "conv_abc",
     sentForConversationId: null,
     conversationId: "conv_abc",
@@ -1519,9 +1769,24 @@ describe("shouldSendInitialPrompt", () => {
     ["empty string", ""],
   ] as const)("does not send when there is no carried prompt (%s)", (_label, initialPrompt) => {
     // null = user left the field blank (common case); "" = a
-    // manipulated router state. Both are falsy and must never
-    // auto-send — a failure would post an empty/garbage message.
+    // manipulated router state. Both are falsy and — with no files —
+    // must never auto-send: a failure would post an empty/garbage
+    // message.
     expect(shouldSendInitialPrompt({ ...ready, initialPrompt })).toBe(false);
+  });
+
+  it.each([
+    ["null", null],
+    ["empty string", ""],
+  ] as const)("sends an image-only prompt (%s text, files attached)", (_label, initialPrompt) => {
+    // The landing composer's submit gate counts attachments as content,
+    // so the auto-send gate must too: an image-only first message queued
+    // by the server-first create path carries blank text plus files. A
+    // failure here means the session is created but the attached image
+    // is silently dropped — the exact bug the composer fix exposed.
+    expect(shouldSendInitialPrompt({ ...ready, initialPrompt, initialPromptFileCount: 1 })).toBe(
+      true,
+    );
   });
 
   it("does not send twice for the same conversation (once-guard)", () => {
@@ -1646,6 +1911,28 @@ describe("splitSlashCommand", () => {
       token: "/dev-productivity:simplify",
       after: " now",
     });
+  });
+
+  it("treats a known skill name with spaces as one token", () => {
+    const name = "/Simplified Technical English (ASD-STE100)";
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
+      before: "",
+      token: name,
+      after: " rewrite this",
+    });
+    // Without a catalog match only the first word reads as the command.
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
+  });
+
+  it("matches a known skill whose first word is not command-shaped", () => {
+    const name = "/Node.js Best Practices";
+    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
+      before: "",
+      token: name,
+      after: " here",
+    });
+    // Not command-shaped and not in the catalog: nothing to tint.
+    expect(splitSlashCommand(`${name} here`)).toBeNull();
   });
 
   it("returns null when the text isn't a command", () => {

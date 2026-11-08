@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -32,8 +33,28 @@ export interface RememberScope {
   host?: string;
 }
 
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+}
+
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
 export type CodexPersistMode = "session" | "always";
+
+/**
+ * Antigravity (agy) permission-prompt details the approval card must
+ * surface to match agy's own TUI prompt. ``actionDescription`` is what
+ * agy says it wants to do (e.g. "Running pwd command");
+ * ``alwaysAllowPattern`` is the persist pattern agy's prompt offers to
+ * always-allow, when it offers one. Shared by the elicitation event
+ * (`events.ts`), the reduced block (`blocks.ts`), and the ApprovalCard
+ * that renders the description and the "Always allow" button.
+ */
+export interface AgyPermission {
+  actionDescription: string | null;
+  alwaysAllowPattern: string | null;
+}
 
 /**
  * An un-consumed web-composer user message replayed from the session
@@ -259,7 +280,27 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
+  sandboxProfile?: SandboxProfile | null;
+  projectId?: string | null;
+  /**
+   * The session whose Workspace rail lists this one as a side chat; `null` for
+   * anything else, including side chats from before the rail was server-listed.
+   */
+  sideChatParentId?: string | null;
+  /**
+   * Whether the viewer may start side chats here (only the owner of the
+   * session's root can); `null` when the server didn't say.
+   */
+  sideChatAllowed?: boolean | null;
   id: string;
   agentId: string;
   /**
@@ -269,6 +310,8 @@ export interface Session {
    */
   agentName: string | null;
   runnerId?: string | null;
+  /** Current runner reachability; absent when the snapshot omits liveness. */
+  runnerOnline?: boolean;
   /**
    * Host that launched (or should launch) the runner, e.g.
    * ``"host_a1b2"``; ``null`` for CLI/local sessions. Carried on the
@@ -281,6 +324,8 @@ export interface Session {
    * older recorded fixtures may omit it (treated as `null`).
    */
   hostId?: string | null;
+  /** Current host reachability; absent when the snapshot omits liveness. */
+  hostOnline?: boolean;
   /**
    * Whether this session's host is a dormant resumable managed host the
    * server can wake on the next message. Carried on the snapshot so the open
@@ -375,7 +420,7 @@ export interface Session {
   subagentRoutingOverride?: "on" | "off" | null;
   /**
    * Whether the owner opted into letting people with *view* (read-only)
-   * access browse this session's workspace files (the Files/Changes/GitHub
+   * access browse this session's workspace files (the Files/Changes/Pull Requests
    * surfaces and the file contents behind them). `false` by default — a
    * read grant shares the conversation, not the raw filesystem. Owner-set
    * from the share dialog; the rail reads it to decide whether to mount the
@@ -390,11 +435,12 @@ export interface Session {
    * render immediately on conversation resume.
    */
   lastTotalTokens?: number | null;
+  /** False when subtree usage was skipped and must be fetched separately. */
+  usageIncluded?: boolean;
   /**
    * Cumulative session spend in USD, server-computed (the cost-budget
-   * total). ``null``/absent when the session is **unpriced** (no turn
-   * priced yet), so the UI renders "—" rather than ``$0.00``. Lets the
-   * cost indicator render immediately on conversation resume.
+   * total). ``null``/absent when usage was skipped or the session is
+   * unpriced, so unknown spend is never displayed as ``$0.00``.
    */
   totalCostUsd?: number | null;
   /**
@@ -414,9 +460,12 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;
+    /** For `runner_rejected_event`: the persisted item the runner refused (newer servers). */
+    item_id?: string;
   } | null;
   /**
    * Outstanding `response.elicitation_request` event payloads on
@@ -434,6 +483,12 @@ export interface Session {
    * for non-native sessions (their message is already in `items`).
    */
   pendingInputs?: PendingInput[];
+  /**
+   * Saved startup messages that were never delivered, e.g. because the
+   * managed sandbox host didn't come online. Their file blocks still resolve
+   * under this session. Empty when nothing failed or on older servers.
+   */
+  failedInputs?: PendingInput[];
   /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
@@ -470,28 +525,22 @@ export interface Session {
    */
   kind: "default" | "sub_agent";
   /**
-   * Current Claude Code todo list for `omnigent claude` sessions.
-   * Sourced from the server's `_session_todos_cache` at snapshot
-   * build time so the panel survives page refresh. Empty array for
-   * non-claude-native sessions or before the first turn creates todos.
+   * Current native Plan/TODO list reported by a harness. Restored from
+   * persisted session metadata at snapshot build time so the panel survives
+   * page refresh. Empty before the first Plan update.
    */
   todos?: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent has access to (bundled + host-discovered,
-   * subject to the spec's ``skills_filter``). Populated by the
-   * server from the agent cache; ``undefined`` on older snapshots.
-   * The web composer surfaces these in its slash-command menu so
-   * users can fire ``/skill-name``.
-   */
-  skills?: SkillSummary[];
-  /** Discovery state; absent on older servers. */
-  skillsStatus?: SkillsStatus;
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** Whether the connected runner supports settings on this native side chat. */
+  sideChatSettingsSupported?: boolean;
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced
@@ -532,11 +581,13 @@ export interface Session {
 /**
  * Stages of a managed-sandbox launch, in pipeline order. `cloning`
  * only occurs when the session requested a repository workspace;
- * `ready` and `failed` are terminal (`ready` is delivered via SSE
- * only — the snapshot field clears to null on success).
+ * `action_required` is a warning while provisioning: the user needs to
+ * do something, described by the status's `details`. `ready` and
+ * `failed` are terminal (`ready` is delivered via SSE only — the
+ * snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
+  "provisioning" | "action_required" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors
@@ -549,20 +600,27 @@ export interface SandboxStatus {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
+  provider?: string | null;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
-/**
- * One entry in ``Session.skills`` — mirrors
- * ``omnigent.server.schemas.SkillSummary``. Just the name +
- * one-line description so the composer's suggestion menu can list
- * them; the full skill body is loaded server-side at invocation
- * time.
- */
+/** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */
 export interface SkillSummary {
-  /** Lowercase kebab-case identifier, e.g. ``"triage-issues"``. */
+  /** Invocation identifier (the skill's directory name), e.g. ``"triage-issues"``. */
   name: string;
   /** One-line summary from the SKILL.md frontmatter. */
   description: string;
+  /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
+  display_name?: string | null;
+}
+
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";
@@ -587,6 +645,42 @@ export interface ModelConfigurationSource {
   host?: string;
 }
 
+/**
+ * One resolved Devin Fusion pairing. Both halves are real catalog models:
+ * a `lead` (with an `effort` rung and an optional `fast` serving modifier) and
+ * a `sidekick` (with an optional `priority` modifier). `modelUid` is the exact
+ * `--model` id to launch.
+ */
+export interface FusionCombo {
+  /** Full Devin variant id, e.g. `fusion-claude-fable-5-1-medium-sidekick-swe-2-medium`. */
+  modelUid: string;
+  /** Lead family key (a standalone model id), e.g. `claude-fable-5.1`. */
+  lead: string;
+  /** Lead family label, e.g. `Claude Fable 5.1`. */
+  leadLabel: string;
+  /** Lead reasoning effort rung, e.g. `medium`. */
+  effort: string;
+  /** Whether this pairing uses the lead's `-fast` serving variant. */
+  fast: boolean;
+  /** Sidekick key with any `-priority` modifier stripped, e.g. `swe-2-medium`. */
+  sidekick: string;
+  /** Sidekick label, e.g. `SWE-2 Medium`. */
+  sidekickLabel: string;
+  /** Whether this pairing uses the sidekick's `-priority` variant. */
+  priority: boolean;
+}
+
+/**
+ * Structured Fusion picker payload: the full set of real lead/sidekick combos
+ * plus the default. The web builds dependent Lead / Effort / Sidekick selectors
+ * from `combos` and only offers combinations that exist.
+ */
+export interface FusionDescriptor {
+  combos: FusionCombo[];
+  /** `modelUid` of the default combo. */
+  default: string;
+}
+
 /** One runner-owned native model-picker row. */
 export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
@@ -603,4 +697,6 @@ export interface NativeModelOption {
   isDefault?: boolean;
   /** Configuration that supplies this model; never includes credentials. */
   source?: ModelConfigurationSource;
+  /** Present only on Devin's Fusion option: its lead/sidekick combo table. */
+  fusion?: FusionDescriptor;
 }

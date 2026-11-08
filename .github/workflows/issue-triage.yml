@@ -62,6 +62,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  OMNIGENT_CI_PIPELINE: issue-triage
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -74,7 +75,7 @@ env:
 jobs:
   triage:
     name: Legacy intake fallback
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Deprecated: remove in 0.12.0 after the seven-day V2 intake canary.
     # This fallback runs only while V2 is disabled.
@@ -103,14 +104,14 @@ jobs:
 
       - name: Check out repo
         if: steps.creds.outputs.available == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Set up Python
         if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -124,7 +125,7 @@ jobs:
         run: |
           # Derive everything downstream needs from the single source of truth,
           # .github/areas.json:
-          #   /tmp/owners.json   -- flat allowlist of every area owner (the ONLY
+          #   /tmp/owners.json   -- flat allowlist of active area owners (the ONLY
           #                         logins the assignment step may ever pick).
           #   /tmp/components.json -- the set of comp:* labels the validator allows.
           #   /tmp/areas_prompt.txt -- the AREAS block injected into the triage
@@ -132,16 +133,19 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib
 
-          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
+          config = json.loads(pathlib.Path(".github/areas.json").read_text())
+          areas = config["areas"]
+          paused = {login.casefold() for login in config.get("assignment_paused", [])}
 
           owners, components, lines = [], set(), []
           for a in areas:
-              for o in a.get("owners", []):
+              active_owners = [o for o in a.get("owners", []) if o.casefold() not in paused]
+              for o in active_owners:
                   if o not in owners:
                       owners.append(o)
               components.add(a["label"])
               lines.append(
-                  f"- {a['key']}: {a['definition']} Owners: {', '.join(a.get('owners', []))}."
+                  f"- {a['key']}: {a['definition']} Owners: {', '.join(active_owners)}."
               )
 
           pathlib.Path("/tmp/owners.json").write_text(json.dumps(owners))
@@ -205,7 +209,7 @@ jobs:
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -218,7 +222,7 @@ jobs:
 
       - name: Cache virtualenv
         if: steps.creds.outputs.available == 'true'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -230,17 +234,9 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          # Install outside the checked-out tree: a repo-root package.json would
-          # otherwise capture this bare `npm install` and hoist it there, leaving
-          # this dir's node_modules empty.
-          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        with:
+          harness: claude
 
       - name: Set LLM credentials
         if: steps.creds.outputs.available == 'true'
@@ -274,6 +270,9 @@ jobs:
           mkdir -p "$HOME/.omnigent"
           python3 -c "
           import pathlib, os, json
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+          if not ci_request_tags(strict=True).get('pipeline'):
+              raise ValueError('CI pipeline is required')
           gw = os.environ['GATEWAY_BASE_URL']
           host = gw.removesuffix('/serving-endpoints')
           cfg = {
@@ -282,7 +281,7 @@ jobs:
                       'kind': 'gateway',
                       'default': ['anthropic'],
                       'anthropic': {
-                          'base_url': gw + '/anthropic',
+                          'base_url': ci_gateway_base_url(gw, 'anthropic'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
                       },
@@ -658,8 +657,8 @@ jobs:
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
-          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-            --json state --jq '.state')
+          issue_status=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state,assignees)
+          issue_state=$(jq -r '.state' <<<"$issue_status")
           if [ "$issue_state" != "OPEN" ]; then
             exit 0
           fi
@@ -676,24 +675,27 @@ jobs:
           # issue is later reopened — triage only fires on `opened`, so a
           # reopened issue would otherwise come back unassigned.
 
-          # If the issue was filed by a maintainer, assign it to them directly.
+          # Assign maintainer authors directly unless their issue assignments are paused.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
-          maintainer_assigned=false
-          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
+          owner_assigned=$(jq -r '.assignees | length > 0' <<<"$issue_status")
+          if [ "$owner_assigned" = "false" ] && [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
+            jq -e --arg author "$author" \
+              '[(.assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
+              .github/areas.json > /dev/null; then
             echo "Issue filed by maintainer $author — assigning to author"
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-            maintainer_assigned=true
+            owner_assigned=true
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
-          # the PR reviewer path. Skipped if the maintainer-author was already
-          # assigned above. Every triaged issue gets an owner — duplicates
+          # the PR reviewer path. Skipped if the issue already has an owner.
+          # Every triaged issue gets an owner — duplicates
           # included, even ones about to be closed below — so the only issues
           # left unassigned are needs_info ones (too vague to route until the
           # reporter adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
-          if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
+          if [ "$owner_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
             # One trusted query; the LLM never sees GH_TOKEN.
             gh issue list --repo "$REPO" --state open --limit 500 \
@@ -763,7 +765,7 @@ jobs:
         if: >-
           failure() ||
           steps.triage_agent.outputs.succeeded == 'false'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: triage-logs-${{ github.run_id }}
           path: |
@@ -776,6 +778,11 @@ jobs:
   prioritize-v2:
     name: Classify and prioritize issue with v2
     needs: triage
+    # A called workflow cannot exceed this grant; it mirrors priority onto PRs.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: >-
       always() &&
       vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' &&
@@ -792,6 +799,7 @@ jobs:
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
+      pipeline: issue-triage
       issue_number: ${{ fromJSON(format('{0}', github.event.issue.number || inputs.issue_number)) }}
       intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
       apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}

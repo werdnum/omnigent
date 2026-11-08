@@ -17,18 +17,24 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
-/** True when `id` is the focused conversation and its agent loop is live. */
+/** True while this session’s agent loop is live, including visible grid panes. */
 export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  if (!conversationId || conversationId !== focusedId) return false;
-  return sessionStatus === "running" || sessionStatus === "waiting";
+  const gridEnabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
+  const scoped = useConversationEntryState(gridEnabled ? (conversationId ?? null) : null);
+  const status =
+    conversationId === focusedId ? sessionStatus : gridEnabled ? scoped.sessionStatus : null;
+  return !!conversationId && (status === "running" || status === "waiting");
 }
 
 /**
@@ -99,6 +105,7 @@ interface WorkspaceQueryOptions {
 export interface WorkspaceChangedFile {
   path: string;
   name: string;
+  repository_root?: string;
   /** Change status: "created", "modified", or "deleted". */
   status: "created" | "modified" | "deleted";
   bytes: number | null;
@@ -185,6 +192,37 @@ function useRunnerRecovering(conversationId: string | undefined): boolean {
   return isLoading || liveness.kind === "starting";
 }
 
+/**
+ * The `retry` option for a runner-backed query: retry a runner-offline error
+ * only while `allowed`, read when each retry is decided. TanStack keeps the
+ * `retry` a fetch started with for its whole chain, so a gate captured in that
+ * closure kept its page-load value ("snapshot still loading → retry") and
+ * retried an asleep sandbox for two minutes.
+ */
+export function useRunnerOfflineRetry(allowed: boolean) {
+  const allowedRef = useRef(allowed);
+  allowedRef.current = allowed;
+  return useCallback(
+    (failureCount: number, error: Error) =>
+      allowedRef.current && shouldRetryRunnerOffline(failureCount, error),
+    [],
+  );
+}
+
+/**
+ * Whether the session's resumable managed sandbox is asleep (`host_asleep`):
+ * neither its runner nor its host can serve the workspace until a message
+ * wakes it.
+ */
+export function useWorkspaceAsleep(conversationId: string | undefined): boolean {
+  const { session } = useSession(conversationId);
+  const turnActive = useSessionActive(conversationId);
+  const liveness = useSessionLiveness(conversationId, livenessRowFromSession(session), {
+    turnActive,
+  });
+  return liveness.kind === "host_asleep";
+}
+
 /** Whether `res` is the app's runner-offline 503 response. */
 export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
   if (res.status !== 503) return false;
@@ -202,6 +240,7 @@ interface ChangedFilesResponse {
   data: {
     path: string;
     name: string;
+    repository_root?: string;
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
@@ -213,9 +252,11 @@ interface ChangedFilesResponse {
 
 async function fetchWorkspaceChangedFiles(
   conversationId: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceChangedFilesResult> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/changes`,
+    { signal },
   );
   if (res.status === 404) {
     return { available: false, data: [] };
@@ -244,6 +285,7 @@ async function fetchWorkspaceChangedFiles(
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,
     name: e.name,
+    repository_root: e.repository_root,
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
@@ -267,7 +309,7 @@ export function useWorkspaceChangedFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -275,13 +317,13 @@ export function useWorkspaceChangedFiles(
   useTrailingInvalidate(conversationId, sessionActive, "workspace-changed-files");
   return useQuery({
     queryKey: ["workspace-changed-files", conversationId],
-    queryFn: () => fetchWorkspaceChangedFiles(conversationId!),
+    queryFn: ({ signal }) => fetchWorkspaceChangedFiles(conversationId!, signal),
     enabled:
       queryEnabled &&
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     // No polling: the SSE ``session.changed_files.invalidated`` event
     // (runner-emitted after file-mutating tools, throttled) drives
@@ -317,6 +359,9 @@ interface FilesystemListResponse {
     modified_at: number | null;
   }[];
   has_more: boolean;
+  last_id?: string | null;
+  /** True when the server stopped scanning before it covered the tree. */
+  truncated?: boolean;
 }
 
 /**
@@ -405,7 +450,7 @@ export function useWorkspaceAllFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -419,7 +464,7 @@ export function useWorkspaceAllFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     // Keep the tree warm on revisits: within staleTime a return to a
     // previously-loaded conversation/location paints its cached tree with no
@@ -513,13 +558,23 @@ export function relativizeToWorkspace(
 
 // ── Recursive file search ──────────────────────────────────────────────────────
 
+export interface WorkspaceFileSearchResult {
+  files: WorkspaceFile[];
+  /**
+   * True when the server gave up before covering the whole tree, so a file
+   * missing from `files` may still exist. The UI must not present that as a
+   * definitive "no match".
+   */
+  truncated: boolean;
+}
+
 async function fetchWorkspaceFileSearch(
   conversationId: string,
   query: string,
   include: string,
   exclude: string,
   location: string,
-): Promise<WorkspaceFile[]> {
+): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
@@ -533,20 +588,23 @@ async function fetchWorkspaceFileSearch(
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return [];
-  if (await isRunnerUnavailable503(res)) return [];
+  if (res.status === 404) return { files: [], truncated: false };
+  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse, location);
+  const json = (await res.json()) as FilesystemListResponse;
+  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
 }
 
 /**
  * Search for files recursively in the workspace by name/path substring,
  * optionally scoped by include/exclude glob filters (VSCode-style).
  *
- * Calls the server-side ``/search`` endpoint which performs a full directory
- * walk so results include files in unexpanded subdirectories.  The query is
- * disabled when ``query`` is empty — the include/exclude globs only narrow an
- * active text query, they do not search on their own.
+ * Calls the server-side ``/search`` endpoint which covers the whole workspace
+ * so results include files in unexpanded subdirectories.  The result carries
+ * ``truncated`` when the server stopped early, so an empty ``files`` is not
+ * proof of absence.  The query is disabled when ``query`` is empty — the
+ * include/exclude globs only narrow an active text query, they do not search
+ * on their own.
  *
  * @param conversationId Session/conversation id, or undefined when not ready.
  * @param query Free-text name/path substring; required for the query to fire.
@@ -612,8 +670,10 @@ async function fetchWorkspaceDirectory(
  *
  * Keeps us from firing a directory listing for every backtick span (`git
  * status`, `useState`, `npm test`, …). A candidate must have a parent segment
- * before its first slash, not be absolute (the FileViewer rejects absolute
- * paths), not be a URL or carry a query/fragment, and not have whitespace
+ * before its first slash, not be absolute (absolute forms are collapsed or
+ * kept host-absolute by {@link resolveChatFilePath}, which marks its results
+ * trusted so they bypass this gate), not be a URL or carry a query/fragment,
+ * and not have whitespace
  * before its first slash (which marks a command like `git diff src/app`
  * rather than a path). Every slash-delimited segment must be non-empty and
  * not a `.`/`..` traversal segment (rejects `a/`, `a//b`, `../x`). Spaces
@@ -622,7 +682,7 @@ async function fetchWorkspaceDirectory(
  */
 export function looksLikeWorkspaceFilePath(text: string): boolean {
   if (!text) return false;
-  if (text.startsWith("/")) return false; // absolute paths are rejected by FileViewer
+  if (text.startsWith("/")) return false; // absolute forms go through resolveChatFilePath
   if (text.includes("://")) return false; // URLs (http://, file://, …)
   if (text.includes("?") || text.includes("#")) return false; // query/fragment → not a plain path
   const slash = text.indexOf("/");
@@ -636,47 +696,72 @@ export function looksLikeWorkspaceFilePath(text: string): boolean {
   return segments.every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
 
+/** A chat-cited path resolved to a form the filesystem API can open. */
+export interface ChatFileResolution {
+  /**
+   * Workspace-relative path (``src/app.ts``), or host-absolute path with its
+   * leading slash (``/etc/hosts``) when the file lies outside the workspace
+   * root. Both forms are what the FileViewer / filesystem API accept — the
+   * absolute one rides the same ``base=host`` wire form the files panel's
+   * outside-workspace browsing uses.
+   */
+  path: string;
+  /**
+   * True when resolution proved the path's shape by collapsing an absolute or
+   * ``~``-relative form, so the existence check's path-shape heuristic
+   * ({@link looksLikeWorkspaceFilePath}) must not re-gate it.
+   */
+  trusted: boolean;
+}
+
 /**
- * Resolve a path mentioned in chat to a workspace-relative path, or null.
+ * Resolve a path mentioned in chat to an openable form, or null.
  *
- * The filesystem API (existence check, FileViewer) speaks workspace-relative
- * paths, but the agent often writes absolute (``/home/u/ws/foo.md``) or
- * home-relative (``~/ws/foo.md``) forms. This collapses those onto ``root``:
+ * The agent writes paths in several shapes — plain relative
+ * (``src/app.tsx``), absolute (``/home/u/ws/foo.md``), or home-relative
+ * (``~/ws/foo.md``). This maps each onto what the filesystem API speaks:
  *
- *  - plain relative (``src/app.tsx``) → returned unchanged (the caller's
- *    existing path-shape heuristic still gates it).
- *  - ``~``-prefixed → expanded with ``home``, then stripped of ``root``.
- *  - absolute under ``root`` → stripped of ``root``.
+ *  - plain relative → returned unchanged (the caller's path-shape heuristic
+ *    still gates it).
+ *  - ``~``-prefixed → expanded with ``home``, then resolved like an absolute.
+ *  - absolute under ``root`` → stripped to workspace-relative, matching the
+ *    changed-files list and relative filesystem routes.
+ *  - absolute OUTSIDE ``root`` → kept host-absolute. The FileViewer and the
+ *    filesystem API already open such paths via ``base=host`` (the files
+ *    panel's browse-anywhere plumbing), so an agent-cited file outside the
+ *    workspace is openable exactly as far as the session's reach allows —
+ *    the existence check still confirms it before anything linkifies.
  *
- * Returns null when the path is absolute/home-relative but lies OUTSIDE the
- * workspace root (can't open in the FileViewer), is the root directory itself,
- * or is ``~``-relative with no ``home`` to expand.
+ * Returns null when the path is the workspace root itself (a directory),
+ * ``~``-relative with no ``home`` to expand, or absolute while the root is
+ * still unknown (inside/outside can't be told apart yet; the caller re-runs
+ * once the environment metadata loads).
  *
- * The returned relative path is always free of empty/``.``/``..`` segments: an
- * absolute path with interior traversal (``/root/ws/../etc/hosts``) would strip
- * to ``../etc/hosts``, which could escape the workspace once turned into a
- * fetch/FileViewer URL — those resolve to null instead. URLs and paths carrying
- * a query/fragment (``?``/``#``) are rejected up-front (mirroring
- * {@link looksLikeWorkspaceFilePath}) so an absolute span like
- * ``/root/ws/foo.md#L12`` doesn't strip to ``foo.md#L12`` and fire a doomed
- * existence check that can never match a real file.
+ * The returned path is always free of empty/``.``/``..`` segments: interior
+ * traversal (``/root/ws/../etc/hosts``) could land the normalized fetch /
+ * FileViewer URL somewhere other than the cited text claims — those resolve
+ * to null instead. URLs and paths carrying a query/fragment (``?``/``#``)
+ * are rejected up-front (mirroring {@link looksLikeWorkspaceFilePath}) so an
+ * absolute span like ``/root/ws/foo.md#L12`` doesn't strip to ``foo.md#L12``
+ * and fire a doomed existence check that can never match a real file.
  *
- * @param text Raw path string from an inline-code span.
+ * @param text Raw path string from an inline-code span or link href.
  * @param root Absolute workspace root, e.g. ``"/home/u/ws"``, or null.
  * @param home Absolute runner home, e.g. ``"/home/u"``, or null.
- * @returns Workspace-relative path (no leading slash), or null if not
- *   resolvable into the workspace.
+ * @returns The resolved path and its trust marker, or null if unresolvable.
  */
-export function toWorkspaceRelativePath(
+export function resolveChatFilePath(
   text: string,
   root: string | null,
   home: string | null,
-): string | null {
+): ChatFileResolution | null {
   if (!text) return null;
   // URLs / query / fragment can never name a workspace file. Reject before
   // any stripping so a "trusted" absolute path doesn't carry these markers
   // past the existence-check heuristic and trigger a fetch that can't match.
   if (text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  // Windows paths (`C:\x`, `\\host\x`) would otherwise pass as one relative segment.
+  if (/^[A-Za-z]:/.test(text) || text.includes("\\")) return null;
   let p = text;
   if (home && (p === "~" || p.startsWith("~/"))) {
     // Strip a trailing slash off home so "/" home (root user) doesn't
@@ -686,19 +771,25 @@ export function toWorkspaceRelativePath(
   if (!p.startsWith("/")) {
     // A leftover "~" means home-relative with no home to expand → unresolvable.
     if (p.startsWith("~")) return null;
-    return hasUnsafeSegments(p) ? null : p; // plain relative path
+    return hasUnsafeSegments(p) ? null : { path: p, trusted: false };
   }
-  // Absolute: must live under the workspace root to be openable.
+  // Absolute: with the root unknown, inside and outside the workspace are
+  // indistinguishable — resolve nothing rather than guess (re-resolved once
+  // the environment metadata loads).
   if (!root) return null;
   const normRoot = root.replace(/\/+$/, "");
-  if (p === normRoot) return null; // the root directory itself, not a file
+  if (p === normRoot || p === "/") return null; // a directory, not a file
   const prefix = `${normRoot}/`;
-  if (!p.startsWith(prefix)) return null; // absolute but outside the workspace
-  const rel = p.slice(prefix.length);
-  // The stripped tail may still contain interior traversal (e.g.
-  // "/root/ws/../etc/hosts" → "../etc/hosts"). Reject it so the resolved
-  // path can't escape the workspace via a normalized fetch/FileViewer URL.
-  return hasUnsafeSegments(rel) ? null : rel;
+  if (p.startsWith(prefix)) {
+    const rel = p.slice(prefix.length);
+    // The stripped tail may still contain interior traversal (e.g.
+    // "/root/ws/../etc/hosts" → "../etc/hosts"). Reject it so the resolved
+    // path can't escape the workspace via a normalized fetch/FileViewer URL.
+    return hasUnsafeSegments(rel) ? null : { path: rel, trusted: true };
+  }
+  // Outside the workspace: keep the host-absolute form (leading slash marks
+  // it for base=host routing). Same canonical-form bar as the relative case.
+  return hasUnsafeSegments(p.slice(1)) ? null : { path: p, trusted: true };
 }
 
 /**
@@ -709,55 +800,128 @@ function hasUnsafeSegments(rel: string): boolean {
   return rel.split("/").some((seg) => seg === "" || seg === "." || seg === "..");
 }
 
+/** A bounded parent-directory listing and whether more entries remain. */
+interface DirListingPage {
+  files: WorkspaceFile[];
+  /** True when the listing was truncated (`has_more`), so a file missing
+   * from `files` may simply live past the page limit — absence unproven. */
+  truncated: boolean;
+}
+
+const FILE_EXISTENCE_SCAN_LIMIT = 10_000;
+
 async function fetchDirEntriesTolerant(
   conversationId: string,
   dirPath: string,
-): Promise<WorkspaceFile[]> {
+): Promise<DirListingPage | null> {
   // An empty dirPath is the workspace root — its listing lives at the bare
   // ``/filesystem`` endpoint, not ``/filesystem/`` (a root-level file like
-  // ``foo.md`` resolves to a "" parent).
+  // ``foo.md`` resolves to a "" parent). A leading slash marks a
+  // host-absolute parent (an agent-cited file outside the workspace); it
+  // rides the shared slash-merge-safe wire form: slashless segment plus
+  // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
+  // listing echo back base-relative names, so the listed dir is re-attached
+  // below and callers compare full paths uniformly.
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
-  const encodedPath = dirPath.split("/").map(encodeURIComponent).join("/");
-  const res = await authenticatedFetch(
-    dirPath === "" ? `${base}?limit=1000&order=asc` : `${base}/${encodedPath}?limit=1000&order=asc`,
-  );
-  // 404 = the directory (or the whole OS environment) is absent, so the file
-  // can't exist. Degrade to "no entries" rather than surfacing an error.
-  if (res.status === 404) return [];
-  if (await isRunnerUnavailable503(res)) return [];
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return mapFilesystemEntries((await res.json()) as FilesystemListResponse);
+  const params = new URLSearchParams({ order: "asc" });
+  const hostBase = browseLocationBase(dirPath);
+  if (hostBase) params.set("base", hostBase);
+  const segment = browseLocationSegment(dirPath);
+  const files: WorkspaceFile[] = [];
+  let after: string | null = null;
+  // Each request needs the cursor returned by the previous page.
+  /* oxlint-disable no-await-in-loop */
+  while (files.length < FILE_EXISTENCE_SCAN_LIMIT) {
+    params.set("limit", String(Math.min(1000, FILE_EXISTENCE_SCAN_LIMIT - files.length)));
+    if (after) params.set("after", after);
+    let body: FilesystemListResponse;
+    let page: WorkspaceFile[];
+    try {
+      const res = await authenticatedFetch(
+        segment === "" ? `${base}?${params}` : `${base}/${segment}?${params}`,
+      );
+      // A missing or inaccessible parent proves absence only before a listing
+      // begins. If it changes between pages, the result is inconclusive.
+      if (res.status === 404 || res.status === 403) {
+        return files.length ? { files, truncated: true } : { files: [], truncated: false };
+      }
+      if (await isRunnerUnavailable503(res))
+        return files.length ? { files, truncated: true } : null;
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      body = (await res.json()) as FilesystemListResponse;
+      page = mapFilesystemEntries(body, "", hostBase ? dirPath : "");
+    } catch (error) {
+      if (files.length) return { files, truncated: true };
+      throw error;
+    }
+    files.push(...page);
+    if (!body.has_more) return { files, truncated: false };
+    if (!page.length || !body.last_id || body.last_id === after) {
+      return { files, truncated: true };
+    }
+    after = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { files, truncated: true };
+}
+
+/** Result of {@link useWorkspaceFileExists}. */
+export interface WorkspaceFileExistence {
+  /** True when the parent listing confirms `path` names an existing file. */
+  exists: boolean;
+  /** True when the parent listing shows `path` names a directory instead. */
+  isDirectory: boolean;
+  /**
+   * True only when a parent listing actually completed successfully for the
+   * current inputs and fully answered the question, so `exists: false` means
+   * "verified absent". False while the query is loading, disabled (no
+   * conversation, workspace not serveable), errored, answered by an
+   * unavailable runner, skipped because the candidate isn't path-shaped, or
+   * when a truncated (`has_more`) page missed the file (it may live past the
+   * page limit) — in all of those the check never ran to a verified answer,
+   * so callers must not treat the file as known-missing.
+   */
+  settled: boolean;
 }
 
 /**
- * Check whether `path` names an existing *file* in the session workspace.
+ * Check whether `path` names an existing *file* the session can open, or a
+ * directory (reported separately so a folder never reads as missing).
  *
- * Backed by a listing of the path's PARENT directory — cheap (one stat-level
- * listing, metadata only), shared across sibling files via the React Query
- * cache, and far lighter than a recursive `/search` walk or a full content
- * read. Returns `false` while loading, when `path` is null or not path-shaped,
- * or when the runner has no OS environment for this session.
+ * Backed by a bounded listing of the path's PARENT directory, shared across
+ * sibling files via the React Query cache. A directory beyond the scan limit
+ * cannot prove absence. Reports `exists: false` while loading, when `path` is
+ * null or not path-shaped, or when the runner has no OS environment.
+ *
+ * A host-absolute `path` (leading slash — a file outside the workspace root)
+ * lists its absolute parent via the ``base=host`` wire form; the entries echo
+ * back absolute, so the same comparison applies.
  *
  * @param conversationId Session/conversation id, or undefined when not ready.
- * @param path Candidate workspace-relative path, or null to disable the check.
+ * @param path Candidate workspace-relative or host-absolute path, or null to
+ *   disable the check.
  * @param trusted When true, skip the {@link looksLikeWorkspaceFilePath}
- *   heuristic — the caller already proved the path is workspace-relative by
- *   resolving an absolute/home-relative form against the root (see
- *   {@link toWorkspaceRelativePath}). Such a path may be a bare basename
+ *   heuristic — the caller already proved the path's shape by resolving an
+ *   absolute/home-relative form against the root (see
+ *   {@link resolveChatFilePath}). Such a path may be a bare basename
  *   (``foo.md``, no interior slash) that the heuristic would reject.
  */
 export function useWorkspaceFileExists(
   conversationId: string | undefined,
   path: string | null,
   trusted = false,
-): boolean {
+): WorkspaceFileExistence {
   const serveable = useWorkspaceServeable(conversationId);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
-  // Parent of a root-level file (no slash) is "" — the workspace root listing.
+  // Parent of a root-level file (no slash) is "" — the workspace root
+  // listing. For an absolute candidate the parent keeps its leading slash
+  // ("/etc/hosts" → "/etc", "/foo" → "/") so the fetch routes via base=host.
   const parentDir = candidate
-    ? candidate.includes("/")
-      ? candidate.slice(0, candidate.lastIndexOf("/"))
-      : ""
+    ? candidate.startsWith("/")
+      ? candidate.slice(0, candidate.lastIndexOf("/")) || "/"
+      : candidate.includes("/")
+        ? candidate.slice(0, candidate.lastIndexOf("/"))
+        : ""
     : null;
   const query = useQuery({
     // Distinct prefix from `useWorkspaceDirectory` ("workspace-dir") because
@@ -771,8 +935,20 @@ export function useWorkspaceFileExists(
     // path span, so a 30s cache keeps repeated mentions from re-listing.
     staleTime: 30_000,
   });
-  if (!candidate) return false;
-  return (query.data ?? []).some((e) => e.type === "file" && e.path === candidate);
+  // No candidate = the check was SKIPPED (not path-shaped and untrusted),
+  // not run-and-found-nothing — it must never read as "verified absent".
+  if (!candidate) return { exists: false, isDirectory: false, settled: false };
+  const listing = query.data ?? null;
+  const entry = listing?.files.find((e) => e.path === candidate);
+  // Only a listing that genuinely completed proves absence: errors and
+  // unavailable-runner responses (data === null) leave the answer open. A
+  // hit settles even a truncated page, but a miss on a truncated page
+  // doesn't — the file may simply live past the page limit.
+  return {
+    exists: entry?.type === "file",
+    isDirectory: entry?.type === "directory",
+    settled: query.isSuccess && listing !== null && (!!entry || !listing.truncated),
+  };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────
@@ -853,12 +1029,12 @@ export function useWorkspaceEnvironment(
   // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
     enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
   });
@@ -907,6 +1083,7 @@ export function useWorkspaceDirectories(
   conversationId: string | undefined,
   dirPaths: string[],
   location = "",
+  refreshToken = 0,
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
@@ -932,7 +1109,10 @@ export function useWorkspaceDirectories(
   );
   return useQueries({
     queries: dirPaths.map((dirPath) => ({
-      queryKey: ["workspace-dir", conversationId, dirPath, location],
+      queryKey:
+        refreshToken === 0
+          ? ["workspace-dir", conversationId, dirPath, location]
+          : ["workspace-dir", conversationId, dirPath, location, refreshToken],
       queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
       enabled,
       staleTime: 5_000,

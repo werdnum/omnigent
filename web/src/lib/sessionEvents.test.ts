@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
@@ -26,7 +27,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
-  SessionSkillsEvent,
   SessionStatusEvent,
   SessionTerminalActivityEvent,
   SessionTerminalPendingEvent,
@@ -775,6 +775,22 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     },
   );
 
+  it.each([
+    { directories: undefined },
+    { directories: null },
+    { directories: "/worktrees/branch" },
+    { directories: {} },
+    { directories: [""] },
+    { directories: ["/worktrees/branch", 123] },
+  ])("ignores malformed directory hints: $directories", ({ directories }) => {
+    const out = parse("response.elicitation_request", {
+      elicitation_id: "elicit_directory",
+      params: { message: "Approve Edit?", permission_directories: directories },
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).permissionDirectories).toBeUndefined();
+  });
+
   it("lifts the allow_all_edits hint for claude-native edit-tool prompts", () => {
     // The server stamps ``allow_all_edits`` on edit-tool
     // PermissionRequests so the card can offer "Accept & allow all
@@ -822,6 +838,38 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as ElicitationRequest;
     expect(ev.allowAllEdits).toBe(false);
+  });
+
+  it.each([
+    {
+      label: "a well-formed hint",
+      hint: { tool_name: "Edit", tool_input: { file_path: "/a.py" } },
+      expected: { toolName: "Edit", toolInput: { file_path: "/a.py" } },
+    },
+    { label: "a hint without a tool name", hint: { tool_input: {} }, expected: null },
+    {
+      label: "a hint whose input is not an object",
+      hint: { tool_name: "Edit", tool_input: [] },
+      expected: null,
+    },
+    { label: "no hint", hint: undefined, expected: null },
+  ])("parses file_edit from $label", ({ hint, expected }) => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_file_edit",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        file_edit: hint,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).fileEdit).toEqual(expected);
   });
 
   it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
@@ -916,6 +964,75 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(out).toHaveLength(1);
     const ev = out[0] as ElicitationRequest;
     expect(ev.codexPersistModes).toEqual(["session", "always"]);
+  });
+
+  it("lifts agy permission action description and advertised persist pattern", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_agy",
+      params: {
+        mode: "form",
+        message: "Antigravity wants to run: pwd",
+        phase: "agy_permission",
+        policy_name: "agy_native_permission",
+        content_preview: "",
+        requestedSchema: {},
+        action_description: "Running pwd command",
+        always_allow_pattern: "pwd",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toEqual({
+      actionDescription: "Running pwd command",
+      alwaysAllowPattern: "pwd",
+    });
+  });
+
+  it("defaults agy permission extras to null when absent or malformed", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_agy_bare",
+      params: {
+        mode: "form",
+        message: "Antigravity wants to run: pwd",
+        phase: "agy_permission",
+        policy_name: "agy_native_permission",
+        content_preview: "",
+        requestedSchema: {},
+        // action_description absent; always_allow_pattern a non-string.
+        always_allow_pattern: 123,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toEqual({
+      actionDescription: null,
+      alwaysAllowPattern: null,
+    });
+  });
+
+  it("ignores agy permission extras outside the agy_permission phase", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_not_agy",
+      params: {
+        mode: "form",
+        message: "Codex wants to run date",
+        phase: "codex_command_approval",
+        policy_name: "codex_native_command_approval",
+        content_preview: "",
+        requestedSchema: {},
+        action_description: "Running pwd command",
+        always_allow_pattern: "pwd",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toBeNull();
   });
 });
 
@@ -1330,12 +1447,13 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
+  it("lifts conversation_id, stage, error, and provider", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",
       conversation_id: "conv_abc",
       stage: "cloning",
       error: null,
+      provider: "arclet",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
@@ -1343,6 +1461,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
     expect(ev.error).toBeNull();
+    expect(ev.provider).toBe("arclet");
   });
 
   it("carries the failure reason on stage=failed", () => {
@@ -1356,6 +1475,21 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     const ev = out[0] as SessionSandboxStatusEvent;
     expect(ev.stage).toBe("failed");
     expect(ev.error).toBe("managed sandbox launch failed: spend limit reached");
+  });
+
+  it("keeps an action_required frame and what it asks the user to do", () => {
+    const out = parse("session.sandbox_status", {
+      type: "session.sandbox_status",
+      conversation_id: "conv_abc",
+      stage: "action_required",
+      error: null,
+      provider: "arclet",
+      details: "Refresh your dbcert on your laptop.",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionSandboxStatusEvent;
+    expect(ev.stage).toBe("action_required");
+    expect(ev.details).toBe("Refresh your dbcert on your laptop.");
   });
 
   it("drops frames with an unknown stage", () => {
@@ -1514,6 +1648,32 @@ describe("session.codex_approval_mode (FLAT envelope)", () => {
 
   it("rejects missing conversation_id", () => {
     expect(parse("session.codex_approval_mode", { approval_mode: "approve-for-me" })).toEqual([]);
+  });
+});
+
+describe("session.background_tasks (FLAT envelope)", () => {
+  it("lifts the count and each task's command", () => {
+    const events = parse("session.background_tasks", {
+      conversation_id: "conv_abc",
+      background_task_count: 1,
+      background_tasks: [{ id: "proc_0", command: "npm run dev" }],
+    });
+    expect(events).toEqual([
+      {
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 1,
+        backgroundTasks: [{ id: "proc_0", command: "npm run dev" }],
+      } satisfies SessionBackgroundTasksEvent,
+    ]);
+  });
+
+  it.each([
+    ["no conversation_id", { background_task_count: 1 }],
+    ["no count", { conversation_id: "conv_abc" }],
+    ["a negative count", { conversation_id: "conv_abc", background_task_count: -1 }],
+  ])("rejects %s", (_case, data) => {
+    expect(parse("session.background_tasks", data)).toEqual([]);
   });
 });
 
@@ -1711,36 +1871,6 @@ describe("session.terminal.activity (FLAT envelope)", () => {
         session_id: "conv_abc",
       }),
     ).toEqual([]);
-  });
-});
-
-describe("session.skills (FLAT envelope)", () => {
-  it("lifts conversation_id into the bare nudge", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "conv_abc",
-    });
-    expect(out).toHaveLength(1);
-    const ev = out[0] as SessionSkillsEvent;
-    expect(ev.type).toBe("session_skills");
-    expect(ev.conversationId).toBe("conv_abc");
-  });
-
-  it("rejects missing conversation_id", () => {
-    // Without a conversation id the store handler can't target a
-    // refetch, so the frame must be dropped rather than lifted.
-    const out = parse("session.skills", {
-      type: "session.skills",
-    });
-    expect(out).toEqual([]);
-  });
-
-  it("rejects an empty conversation_id", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "",
-    });
-    expect(out).toEqual([]);
   });
 });
 

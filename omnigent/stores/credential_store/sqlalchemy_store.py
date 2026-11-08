@@ -21,6 +21,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import SqlConnection, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -29,9 +30,18 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ProviderConnection
-from omnigent.stores.credential_store.secret_cipher import SecretCipher
+from omnigent.stores.credential_store.secret_cipher import SecretCipher, SecretTooLargeError
 
 _logger = logging.getLogger(__name__)
+
+
+def _check_encrypted_size(secret_enc: str, dialect_name: str) -> None:
+    """Keep the full cipher envelope within MySQL TEXT's byte capacity."""
+    if dialect_name in {"mysql", "mariadb"} and len(secret_enc.encode("utf-8")) > 65_535:
+        raise SecretTooLargeError(
+            "Encrypted credential exceeds the storage limit of 65535 bytes. "
+            "Ask your provider for a smaller credential."
+        )
 
 
 def _enc_context(
@@ -138,6 +148,7 @@ class CredentialStore:
         pk = (workspace_id, user_id, provider, account_id)
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        _check_encrypted_size(secret_enc, self._engine.dialect.name)
         metadata_json = json.dumps(metadata)
 
         def _apply(session: Session, row: SqlConnection | None) -> SqlConnection:
@@ -159,6 +170,7 @@ class CredentialStore:
             return row
 
         def initial_write(session: Session) -> ProviderConnection:
+            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -171,6 +183,7 @@ class CredentialStore:
             pass
 
         def conflict_write(session: Session) -> ProviderConnection:
+            require_active_account(session, user_id)
             row = _apply(session, session.get(SqlConnection, pk))
             session.flush()
             return self._build_entity(row, secret)
@@ -197,10 +210,12 @@ class CredentialStore:
         workspace_id = current_workspace_id()
         context = _enc_context(workspace_id, user_id, provider, account_id)
         secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        _check_encrypted_size(secret_enc, self._engine.dialect.name)
         metadata_json = json.dumps(metadata) if metadata is not None else None
         updated_at = now_epoch()
 
         def write(session: Session) -> bool:
+            require_active_account(session, user_id)
             row = session.get(SqlConnection, (workspace_id, user_id, provider, account_id))
             if row is None:
                 return False

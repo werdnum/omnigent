@@ -2,22 +2,20 @@
 
 A shared session's shell runs commands on the runner. When the runner is
 not isolated (``sandbox_active: false``), that shell can read files the
-session owner can reach — so write-capable shell access must be gated the
-same way interactive terminal attach is (see ``test_terminal_attach.py``).
+session owner can reach. A command has no path to inspect, so there is no
+"inside the workspace" form that could be opened to collaborators the way
+the filesystem proxy does — the shell is the owner's machine, full stop.
 
 The shell proxy at
 ``POST /v1/sessions/{id}/resources/environments/{env}/shell`` runs
-``_validate_session(required_level=LEVEL_EDIT)`` *before* proxying. These
+``_validate_session(required_level=LEVEL_OWNER)`` *before* proxying. These
 tests pin that gate end to end at the server boundary:
 
-- a read-only collaborator is rejected with 403 and the request never
-  reaches the runner (decisive: the secret-capable shell is unreachable),
-- an edit collaborator is allowed through and the command is proxied,
+- a read-only or edit collaborator is rejected with 403 and the request
+  never reaches the runner (decisive: the secret-capable shell is
+  unreachable),
+- the owner (and an admin) is allowed through and the command is proxied,
 - an unauthenticated caller is rejected.
-
-The deeper gap — an *edit* collaborator on an unsafe runner reading
-out-of-root/sensitive files via shell — is pinned by
-the strict-xfail matrix in ``test_filesystem_path_isolation_e2e.py``.
 
 The filesystem proxy carries a second, stricter gate. Mutations under the
 workspace need ``LEVEL_EDIT``; an ABSOLUTE path is the owner's own machine
@@ -32,11 +30,14 @@ need ``LEVEL_EDIT`` too, UNLESS the session owner opted into sharing files
 ``LEVEL_READ``. A plain read grant otherwise shares the conversation, not the
 raw filesystem — which routinely holds secrets (``.env`` / key files). The
 share opt-in never widens absolute-path browsing, which stays owner-only.
-``conv_share`` has sharing off; ``conv_open`` has it on.
+The same owner bar decides whether a workspace symlink may lead outside the
+workspace: only the owner's workspace-relative reads reach the runner marked
+``scope=reach``. ``conv_share`` has sharing off; ``conv_open`` has it on.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -46,15 +47,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.sessions import create_sessions_router
 
 # The server route is mounted under /v1 and proxies to the runner at the
@@ -71,12 +74,19 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str, *, share_workspace_files: bool = False) -> None:
+    def add(
+        self,
+        conversation_id: str,
+        *,
+        share_workspace_files: bool = False,
+        parent: str | None = None,
+    ) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
-            root_conversation_id=conversation_id,
+            root_conversation_id=parent or conversation_id,
+            parent_conversation_id=parent,
             agent_id="ag_test",
             share_workspace_files=share_workspace_files,
         )
@@ -164,6 +174,7 @@ class _RecordingRunnerClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, Any]] = []
         self.gets: list[str] = []
+        self.get_params: list[Any] = []
         self.puts: list[tuple[str, Any]] = []
         self.deletes: list[str] = []
 
@@ -197,6 +208,7 @@ class _RecordingRunnerClient:
         timeout: float | None = None,
     ) -> httpx.Response:
         del timeout
+        self.get_params.append(params)
         query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
         self.gets.append(f"{url}&{query}" if query and "?" in url else url)
         return httpx.Response(
@@ -274,9 +286,13 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     # A second session whose owner opted into sharing workspace files with
     # view-level collaborators — same grant shape, share flag on.
     conv_store.add("conv_open", share_workspace_files=True)
+    # A sub-agent of conv_share: nobody holds a direct grant on it, so every
+    # caller's access is inherited through the parent.
+    conv_store.add("conv_child", parent="conv_share")
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
+    perm_store.add_grant("manager@example.com", "conv_share", LEVEL_MANAGE)
     perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
     perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_open", LEVEL_READ)
@@ -285,6 +301,7 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
+    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -353,19 +370,41 @@ async def test_shell_rejects_unauthenticated_before_runner(
 
 
 @pytest.mark.asyncio
-async def test_shell_allows_edit_collaborator_and_proxies(
+async def test_shell_rejects_edit_collaborator_before_runner(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
 ) -> None:
-    """An edit collaborator is allowed through and the command is proxied."""
+    """Edit is not enough: the shell has no workspace-relative form, so the
+    bar is the same one an absolute filesystem path carries."""
+    resp = await client.post(
+        _SHELL_PATH,
+        json={"command": "cat ~/.ssh/id_rsa"},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller",
+    ["real-owner@example.com", "admin@example.com"],
+    ids=["owner", "admin"],
+)
+async def test_shell_allows_owner_and_proxies(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+) -> None:
+    """The owner (or an admin) is allowed through and the command is proxied."""
     resp = await client.post(
         _SHELL_PATH,
         json={"command": "echo hi"},
-        headers={"X-Forwarded-Email": "owner@example.com"},
+        headers={"X-Forwarded-Email": caller},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["stdout"] == "ok\n"
-    # The edit-level command reached the runner verbatim.
+    # The owner's command reached the runner verbatim.
     assert runner_client.posts == [(_SHELL_PATH, {"command": "echo hi"})]
 
 
@@ -425,6 +464,50 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
     assert runner_client.gets[0].startswith(f"{_FS_BASE}/%2Fetc/passwd")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,url,marked",
+    [
+        ("real-owner@example.com", _FS_RELATIVE, True),
+        ("admin@example.com", _FS_RELATIVE, True),
+        ("owner@example.com", _FS_RELATIVE, False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_open"), False),
+        ("real-owner@example.com", _FS_ABSOLUTE, False),
+        ("real-owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("admin@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), True),
+        ("manager@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("owner@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+        ("viewer@example.com", _FS_RELATIVE.replace("conv_share", "conv_child"), False),
+    ],
+    ids=[
+        "owner",
+        "admin",
+        "edit-collaborator",
+        "shared-viewer",
+        "owner-absolute",
+        "child-inherited-owner",
+        "child-admin",
+        "child-inherited-manager",
+        "child-inherited-editor",
+        "child-inherited-viewer",
+    ],
+)
+async def test_filesystem_marks_reach_scope_for_the_owner_only(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    url: str,
+    marked: bool,
+) -> None:
+    """Only effective owners receive reach scope for relative reads, including
+    ownership inherited through a parent; an absolute path needs no mark."""
+    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+    assert ("scope=reach" in runner_client.gets[0]) is marked
 
 
 @pytest.mark.asyncio
@@ -568,6 +651,7 @@ _CONTENT_READ_PATHS = (
     "/v1/sessions/{cid}/resources/environments/default/changes",
     "/v1/sessions/{cid}/resources/environments/default/diff/src/app.py",
     "/v1/sessions/{cid}/resources/environments/default/search?q=todo",
+    "/v1/sessions/{cid}/resources/environments/default/content-search?q=todo",
     "/v1/sessions/{cid}/resources/github/changes",
     "/v1/sessions/{cid}/resources/github/diff",
     "/v1/sessions/{cid}/resources/github/diff/src/app.py",
@@ -578,6 +662,7 @@ _CONTENT_READ_IDS = (
     "changed-files",
     "file-diff",
     "search",
+    "content-search",
     "github-changes",
     "github-pr-diff",
     "github-file-diff",
@@ -617,6 +702,56 @@ async def test_workspace_reads_allow_view_only_when_shared(
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email", "routing_error", "status", "error_code"),
+    [
+        ("viewer@example.com", None, 200, None),
+        ("viewer@example.com", ErrorCode.RUNNER_UNAVAILABLE, 403, ErrorCode.FORBIDDEN),
+        ("owner@example.com", ErrorCode.WRONG_REPLICA, 400, ErrorCode.WRONG_REPLICA),
+    ],
+)
+async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    email: str,
+    routing_error: str | None,
+    status: int,
+    error_code: str | None,
+) -> None:
+    """Shared viewers can download live files; recovery needs edit access and the right replica."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    payload = b"shared file"
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            stream=httpx.ByteStream(payload),
+            headers={"Content-Disposition": 'attachment; filename="report.txt"'},
+        )
+    )
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner:
+        lookup = AsyncMock(return_value=runner)
+        if routing_error is not None:
+            lookup.side_effect = OmnigentError("runner unavailable here", code=routing_error)
+        monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", lookup)
+        response = await client.get(
+            "/v1/sessions/conv_open/resources/environments/default/filesystem/report.txt",
+            params={"download": "true"},
+            headers={"X-Forwarded-Email": email},
+        )
+    assert response.status_code == status, response.text
+    if error_code is None:
+        assert response.content == payload
+    else:
+        assert response.json()["error"]["code"] == error_code
+    wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -681,3 +816,351 @@ async def test_filesystem_windows_absolute_is_owner_gated_too(
 
     assert resp.status_code == 403, resp.text
     assert runner_client.gets == []
+
+
+# ── Elicitation resolve gate ─────────────────────────────────────
+#
+# Elicitations (policy ASK gates, harness permission prompts, questions to
+# the user) are answered by any collaborator who can drive the agent
+# (``LEVEL_EDIT``); a read-only share can neither see nor answer them.
+
+_ELICITATION_PATH = "/v1/sessions/conv_share/elicitations/elicit_0123456789abcdef"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [
+        ("real-owner@example.com", 202),
+        ("owner@example.com", 202),
+        ("viewer@example.com", 403),
+    ],
+    ids=["owner-allowed", "edit-allowed", "read-denied"],
+)
+async def test_elicitation_resolve_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """The verdict endpoint is gated at edit, like the events route that
+    delivers the same verdict in-band."""
+    resp = await client.post(
+        f"{_ELICITATION_PATH}/resolve",
+        json={"action": "accept"},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_elicitation_get_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Reading a pending prompt carries the same bar as answering it."""
+    resp = await client.get(_ELICITATION_PATH, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+async def test_elicitation_resolve_rejects_unauthenticated(
+    client: httpx.AsyncClient,
+) -> None:
+    """No identity fails closed at 401 before the permission check."""
+    resp = await client.post(f"{_ELICITATION_PATH}/resolve", json={"action": "accept"})
+
+    assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_content_search_disabled_never_reaches_runner(
+    app: FastAPI, client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    app.state.feature_flags = FeatureFlags()
+    response = await client.get(
+        "/v1/sessions/conv_share/resources/environments/default/content-search?q=todo",
+        headers={"X-Forwarded-Email": "real-owner@example.com"},
+    )
+    assert response.status_code == 404
+    assert runner_client.gets == []
+
+
+@pytest.mark.asyncio
+async def test_content_search_forwards_options(
+    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    path = "/v1/sessions/conv_share/resources/environments/default/content-search"
+    params = {
+        "q": "  Needle.* & more  ",
+        "case_sensitive": "true",
+        "regex": "true",
+        "include": "src/**, *.{py,txt}",
+        "exclude": "**/tests/**, a & b/**",
+        "limit": "7",
+    }
+    response = await client.get(
+        path, params=params, headers={"X-Forwarded-Email": "owner@example.com"}
+    )
+    assert response.status_code == 200, response.text
+    assert runner_client.gets == [path]
+    assert runner_client.get_params == [params]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_endpoint", [True, False])
+async def test_content_search_distinguishes_older_runner_from_missing_resource(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_endpoint: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    payload = (
+        {"detail": "Not Found"}
+        if missing_endpoint
+        else {"error": {"code": "not_found", "message": "Environment not found"}}
+    )
+    monkeypatch.setattr(
+        runner_client, "get", AsyncMock(return_value=httpx.Response(404, json=payload))
+    )
+    response = await client.get(
+        "/v1/sessions/conv_share/resources/environments/default/content-search?q=needle",
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert response.status_code == (503 if missing_endpoint else 404)
+    error = response.json()["error"]
+    assert error["code"] == ("runner_unavailable" if missing_endpoint else "not_found")
+    assert error["message"] == (
+        "Session runner does not support content search; update the host and restart the session"
+        if missing_endpoint
+        else "Environment not found"
+    )
+
+
+_LABELS_PATH = "/v1/sessions/conv_share/resources/github/labels"
+_LABELS_PR_URL = "https://github.com/acme/widgets/pull/17"
+_REVIEWERS_PATH = "/v1/sessions/conv_share/resources/github/reviewers"
+_REVIEWER = {"login": "octocat", "kind": "user"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize("caller", ["owner@example.com", "viewer@example.com"])
+@pytest.mark.parametrize(
+    "resource,code_context,after",
+    [
+        ("", False, None),
+        ("/review-threads", True, None),
+        ("/review-threads", True, "cursor"),
+        ("/review-threads/thread-1/comments", False, "cursor"),
+    ],
+)
+async def test_review_conversation_reads_follow_file_sharing(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    resource: str,
+    code_context: bool,
+    after: str | None,
+    session: str,
+    caller: str,
+) -> None:
+    path = f"/v1/sessions/{session}/resources/github{resource}"
+    params = {"pr_url": _LABELS_PR_URL}
+    if after:
+        params["after"] = after
+        if resource == "/review-threads":
+            params.update(head_sha="a" * 40, base_sha="b" * 40)
+    response = await client.get(path, params=params, headers={"X-Forwarded-Email": caller})
+    if code_context and session == "conv_share" and caller == "viewer@example.com":
+        assert response.status_code == 403, response.text
+        assert runner_client.gets == []
+        return
+    assert response.status_code == 200, response.text
+    assert runner_client.gets == [path]
+    forwarded = (
+        {**params, "after": "", "head_sha": "", "base_sha": ""}
+        if code_context and not after
+        else params
+    )
+    assert runner_client.get_params == [forwarded]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path, added",
+    [(_LABELS_PATH, "bug"), (_REVIEWERS_PATH, _REVIEWER)],
+    ids=["labels", "reviewers"],
+)
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_pr_edit_routes_require_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
+    path: str,
+    added: object,
+) -> None:
+    """PR label and reviewer routes act as the host's account, so viewers are refused."""
+    headers = {"X-Forwarded-Email": caller}
+    listed = await client.get(path, params={"pr_url": _LABELS_PR_URL}, headers=headers)
+    edited = await client.post(
+        path,
+        json={"pr_url": _LABELS_PR_URL, "add": [added], "session_id": "untrusted"},
+        headers=headers,
+    )
+
+    assert (listed.status_code, edited.status_code) == (expected, expected), edited.text
+    if expected == 403:
+        assert runner_client.gets == runner_client.posts == []
+        return
+    assert runner_client.gets == [path]
+    assert runner_client.get_params == [{"pr_url": _LABELS_PR_URL}]
+    assert runner_client.posts == [
+        (path, {"pr_url": _LABELS_PR_URL, "add": [added], "remove": []})
+    ]
+
+
+_MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
+_MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
+_DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
+_MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
+_REVIEW_REPLY_PATH = "/v1/sessions/conv_share/resources/github/review-threads/thread-1/replies"
+_DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
+_ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_pr_merge_routes_require_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Merging acts with the host's account, so viewers are refused before the runner."""
+    headers = {"X-Forwarded-Email": caller}
+    options = await client.get(
+        _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
+    )
+    merged = await client.post(_MERGE_PATH, json=_MERGE_BODY, headers=headers)
+    disabled = await client.post(
+        _DISABLE_AUTO_MERGE_PATH, json={"pr_url": _LABELS_PR_URL}, headers=headers
+    )
+
+    assert (options.status_code, merged.status_code, disabled.status_code) == (
+        expected,
+        expected,
+        expected,
+    ), merged.text
+    if expected == 403:
+        assert runner_client.gets == runner_client.posts == []
+        return
+    assert runner_client.gets == [_MERGE_OPTIONS_PATH]
+    assert runner_client.posts == [
+        (_MERGE_PATH, _MERGE_BODY),
+        (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+@pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
+async def test_pr_details_route_requires_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
+    resource: str,
+) -> None:
+    """Writing PR text acts as the host's account, so viewers are refused."""
+    comment = resource != "details"
+    path = {
+        "details": _DETAILS_PATH,
+        "comment": _COMMENTS_PATH,
+        "reply": _REVIEW_REPLY_PATH,
+        "thread": _REVIEW_REPLY_PATH.removesuffix("/thread-1/replies"),
+    }[resource]
+    fields = {"body": "Hello"} if comment else {"title": "Renamed"}
+    if resource == "thread":
+        fields["anchor"] = {"line": 2}
+    forwarded = {**fields, **({"thread_id": "thread-1"} if resource == "reply" else {})}
+    edited = await client.post(
+        path,
+        json={"pr_url": _LABELS_PR_URL, **fields, "session_id": "untrusted"},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert edited.status_code == expected, edited.text
+    expected_posts = [
+        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **forwarded})
+    ]
+    assert runner_client.posts == ([] if expected == 403 else expected_posts)
+
+
+@pytest.mark.asyncio
+async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
+    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    """An upload lands on the provider as the host's account, so viewers cannot send one."""
+    uploaded = await client.post(
+        _ATTACHMENTS_PATH,
+        data={"pr_url": _LABELS_PR_URL},
+        files={"file": ("shot.png", b"\x89PNG", "image/png")},
+        headers={"X-Forwarded-Email": "viewer@example.com"},
+    )
+
+    assert uploaded.status_code == 403
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"]}),
+        (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
+        (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed"}),
+        (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
+        (_REVIEW_REPLY_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
+        (_MERGE_PATH, _MERGE_BODY),
+        (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
+    ],
+    ids=["labels", "reviewers", "details", "comments", "reply", "merge", "disable-auto-merge"],
+)
+async def test_pr_edit_requires_a_json_body(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    path: str,
+    body: dict[str, object],
+) -> None:
+    """A cross-site form post cannot act with the host's account."""
+    resp = await client.post(
+        path,
+        content=json.dumps(body),
+        headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert runner_client.posts == []

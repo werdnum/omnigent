@@ -43,6 +43,7 @@ from .sandbox import (
     ContainmentHandle,
     SandboxBackend,
     SandboxPolicy,
+    _resolve_grant_root,
     register_backend,
 )
 
@@ -198,13 +199,17 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
             )
 
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+        if any(grant.copy_on_write for grant in sandbox_spec.write_path_specs):
+            raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
         _warn_no_fs_isolation_once()
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [(cwd / r).resolve() for r in sandbox_spec.read_paths]
-        write_roots = [(cwd / w).resolve() for w in (sandbox_spec.write_paths or [])]
-        write_files = [(cwd / f).resolve() for f in (sandbox_spec.write_files or [])]
+            read_roots = [_resolve_grant_root(cwd, r) for r in sandbox_spec.read_paths]
+        write_roots = [
+            _resolve_grant_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs
+        ]
+        write_files = [_resolve_grant_root(cwd, f) for f in (sandbox_spec.write_files or [])]
 
         return SandboxPolicy(
             backend_type=self.type_name,

@@ -8,9 +8,10 @@
  * (API key, gateway) add step kinds server-side and appear here for free.
  */
 
-import type { SetupStepWire } from "@/lib/agentLabels";
+import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
+import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 
 /** Whether a step is satisfied, still needed, or not locally determinable. */
 export type SetupStepStatus = "done" | "todo" | "unknown";
@@ -36,15 +37,198 @@ export interface ResolvedSetupStep {
   harness: string;
 }
 
-/** Whether *harness* is a Codex spelling (bare or native). Codex is the only
- *  family whose flag-off warning copy is harness-specific ("run codex login"),
- *  so the message helper gates on this. */
+export type HarnessReadinessState = "available" | "unavailable" | "broken" | "setup-required";
+
+/** Oldest tmux native terminals accept (mirrors `MIN_TMUX_VERSION` in `omnigent/util/tmux_compat.py`). */
+export const MIN_TMUX_VERSION = "3.3";
+
+export type HarnessReadinessReason =
+  | "ready"
+  | "readiness-unknown"
+  | "harness-unavailable"
+  | "host-unavailable"
+  | "binary-missing"
+  | "needs-auth"
+  | "unconfigured"
+  | "version-too-low"
+  | "tmux-unavailable"
+  | "readiness-error";
+
+export interface HarnessReadinessExplanation {
+  label: string;
+  description: string;
+}
+
+export type HarnessCredentialKind = "isaac" | "personal";
+
+export const HARNESS_CREDENTIAL_COPY: Record<HarnessCredentialKind, HarnessReadinessExplanation> = {
+  isaac: {
+    label: "Isaac",
+    description: "Databricks-managed credential via the Unity Gateway",
+  },
+  personal: {
+    label: "Personal subscription",
+    description: "Your own plan (e.g. Claude Pro/Max, ChatGPT Plus)",
+  },
+};
+
+/** Missing-credential detail shown for a harness on a host. */
+export function missingHarnessCredentialCopy(
+  harness: string,
+  harnessName: string,
+  hostName: string,
+): string {
+  const canonicalHarness = canonicalNativeHarness(harness);
+  const credential = isCodexHarness(harness)
+    ? "ChatGPT account or API key"
+    : canonicalHarness === "claude-native" || canonicalHarness === "claude"
+      ? "Claude subscription or API key"
+      : harnessCredentialFamily(harness) !== null
+        ? "API key or gateway credential"
+        : "credentials";
+  return `No ${credential} on ${hostName}, so new sessions can’t use ${harnessName}.`;
+}
+
+export interface HarnessReadiness {
+  state: HarnessReadinessState;
+  reason: HarnessReadinessReason;
+  selectable: boolean;
+  /** A different harness on the same host may recover this condition. */
+  fallbackRelevant: boolean;
+  explanation: HarnessReadinessExplanation | null;
+}
+
+function harnessReadinessResult(
+  state: HarnessReadinessState,
+  reason: HarnessReadinessReason,
+  fallbackRelevant: boolean,
+  explanation: HarnessReadinessExplanation | null,
+): HarnessReadiness {
+  return {
+    state,
+    reason,
+    selectable: state === "available",
+    fallbackRelevant,
+    explanation,
+  };
+}
+
+/** Resolve selection and fallback behavior from one host readiness value. */
+export function harnessReadinessOnHost(
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): HarnessReadiness {
+  if (!harness) {
+    return harnessReadinessResult("unavailable", "harness-unavailable", true, {
+      label: "Harness unavailable",
+      description: "This agent does not resolve to a runnable harness.",
+    });
+  }
+  if (!host || host.status !== "online") {
+    return harnessReadinessResult("unavailable", "host-unavailable", false, {
+      label: "Host unavailable",
+      description: "Connect an online host before starting a session.",
+    });
+  }
+
+  const configured = host.configured_harnesses;
+  if (!configured || !(harness in configured)) {
+    return harnessReadinessResult("available", "readiness-unknown", false, null);
+  }
+
+  const availability = configured[harness];
+  if (availability === true) {
+    return harnessReadinessResult("available", "ready", false, null);
+  }
+  if (availability === "version-too-low") {
+    return harnessReadinessResult("broken", "version-too-low", true, {
+      label: "Harness is outdated",
+      description: "Update this harness before starting a session with it.",
+    });
+  }
+  if (availability === "tmux-unavailable") {
+    return harnessReadinessResult("setup-required", "tmux-unavailable", true, {
+      label: "tmux is required",
+      description: `Install tmux ${MIN_TMUX_VERSION} or newer on the selected host, then check again.`,
+    });
+  }
+  if (availability === "binary-missing") {
+    return harnessReadinessResult("setup-required", "binary-missing", true, {
+      label: "Harness is not installed",
+      description: "Install this harness on the selected host before using it.",
+    });
+  }
+  if (availability === "needs-auth") {
+    if (isSdkHarness(harness)) {
+      // Advisory only for the in-process SDK harnesses: the host daemon
+      // cannot see agent-level credentials (an agent spec's `executor.auth`),
+      // and the daemon's launch gate stays ungated for them, so a
+      // `needs-auth` SDK agent may still authenticate successfully. Keep the
+      // row selectable; the picker badge and composer notice (driven by
+      // harnessUnavailableReasonOnHost) still warn before launch.
+      return harnessReadinessResult("available", "needs-auth", false, {
+        label: "Authentication may be required",
+        description:
+          "The selected host reports no credentials for this harness. " +
+          "Launching may fail unless the agent supplies its own.",
+      });
+    }
+    return harnessReadinessResult("setup-required", "needs-auth", true, {
+      label: "Authentication required",
+      description: "Sign in or add credentials on the selected host before using this harness.",
+    });
+  }
+  if (availability === false) {
+    return harnessReadinessResult("setup-required", "unconfigured", true, {
+      label: "Setup required",
+      description: "Set up this harness on the selected host before using it.",
+    });
+  }
+  return harnessReadinessResult("broken", "readiness-error", true, {
+    label: "Harness is not working",
+    description: "The selected host reported a harness readiness error.",
+  });
+}
+
+/** The in-process SDK harness spellings the daemon reports readiness for
+ *  (mirrors `_SDK_HARNESSES` + its alias spellings in
+ *  `omnigent/onboarding/harness_readiness.py`). Their launch gate is never
+ *  blocked host-side — agent-level credentials are invisible to the daemon —
+ *  so their `needs-auth` readiness is an advisory warning, not a gate. */
+const SDK_HARNESSES = new Set([
+  "claude-sdk",
+  "claude_sdk",
+  "claude",
+  "openai-agents",
+  "openai-agents-sdk",
+  "agents_sdk",
+  "antigravity",
+  "agy",
+  "google-antigravity",
+]);
+
+/** Whether *harness* is an in-process SDK harness spelling. */
+export function isSdkHarness(harness: string): boolean {
+  return SDK_HARNESSES.has(harness);
+}
+
+/** Whether `harness` is a Codex spelling. */
 export function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }
 
+/** Sigil used to invoke a skill in *harness*: `$` for codex-native, `/` for all others. */
+export function skillInvocationPrefix(harness: string | null | undefined): "$" | "/" {
+  return harness === "codex-native" ? "$" : "/";
+}
+
 export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
+}
+
+/** Whether *harness* is an OpenCode spelling (bare, native, or reversed). */
+export function isNativeOpenCodeHarness(harness: string): boolean {
+  return harness === "opencode-native" || harness === "native-opencode" || harness === "opencode";
 }
 
 /**
@@ -65,17 +249,35 @@ export function harnessUnavailableReasonOnHost(
   }
   // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
   // string when installed-but-not-ready. "version-too-low" can surface for
-  // any CLI-backed harness whose binary is present but too old.
+  // any CLI-backed harness whose binary is present but too old, and
+  // "tmux-unavailable" for a native harness on a host without a usable tmux.
   if (
     availability === "binary-missing" ||
     availability === "needs-auth" ||
-    availability === "version-too-low"
+    availability === "version-too-low" ||
+    availability === "tmux-unavailable"
   ) {
     return availability;
   }
   // Any other string from a newer/older server still means "not ready";
   // show a generic warning rather than silently treating it as available.
   if (typeof availability === "string") {
+    return "unconfigured";
+  }
+  // Missing key on a host that DOES report readiness (a non-empty map): the host
+  // can't launch this harness — its runner has no catalog row for it, e.g. a host
+  // predating a newly-added harness (jcode on a pre-jcode host, which reports
+  // devin/grok but omits jcode). Treat it as unconfigured so "hide unconfigured"
+  // hides it, instead of failing open and offering a harness the host can't run.
+  // Excludes the client-only Smart Routing "auto" sentinels: the daemon never
+  // reports a readiness key for those, so they must stay selectable and unbadged.
+  // An absent/empty map still fails open (the guard above, plus the size check),
+  // so a host that reports no readiness at all is never emptied out.
+  if (
+    availability === undefined &&
+    !isAutoHarness(harness) &&
+    Object.keys(host.configured_harnesses).length > 0
+  ) {
     return "unconfigured";
   }
   return null;
@@ -106,6 +308,7 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
   if (reason === "version-too-low") return "outdated";
+  if (reason === "tmux-unavailable") return "needs tmux";
   return "needs setup";
 }
 
@@ -195,8 +398,10 @@ export function harnessAuthableOnHost(
  * ``"needs-auth"`` (installed, not signed in), ``"binary-missing"`` / ``false``
  * (not installed). Each step's ``status_key`` says which sub-state it tracks:
  * ``"installed"`` is done once the binary is present (anything but not-installed);
- * ``"authed"`` is done only when fully ready. A ``null`` key isn't locally
- * determinable → ``"unknown"`` (informational).
+ * ``"authed"`` is done only when fully ready, or when the only thing missing is
+ * tmux (the host reports ``"tmux-unavailable"`` only for an otherwise ready
+ * harness). A ``null`` key isn't locally determinable → ``"unknown"``
+ * (informational).
  */
 function stepStatus(
   statusKey: string | null,
@@ -208,7 +413,9 @@ function stepStatus(
     availability === "binary-missing" ||
     availability === "version-too-low";
   if (statusKey === "installed") return notInstalled ? "todo" : "done";
-  if (statusKey === "authed") return availability === true ? "done" : "todo";
+  if (statusKey === "authed") {
+    return availability === true || availability === "tmux-unavailable" ? "done" : "todo";
+  }
   return "unknown";
 }
 
@@ -226,9 +433,9 @@ export function resolveSetupSteps(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): ResolvedSetupStep[] {
-  if (!serverSteps || !harness) return [];
+  if (!harness) return [];
   const availability = host?.configured_harnesses?.[harness];
-  const resolved = serverSteps.map((step) => ({
+  const resolved: ResolvedSetupStep[] = (serverSteps ?? []).map((step) => ({
     kind: step.kind,
     title: step.title,
     detail: step.detail,
@@ -237,6 +444,20 @@ export function resolveSetupSteps(
     status: stepStatus(step.status_key, availability),
     harness,
   }));
+  // tmux is a host prerequisite with no server step, so add it while it's the blocker.
+  if (availability === "tmux-unavailable") {
+    resolved.push({
+      kind: "tmux",
+      title: `Install tmux ${MIN_TMUX_VERSION} or newer`,
+      detail:
+        "Native terminals run in tmux on the host. On Linux, use your package manager. " +
+        "If Omnigent still can't find tmux after you install it, quit and reopen the Omnigent app.",
+      action: "command",
+      command: "brew install tmux",
+      status: "todo",
+      harness,
+    });
+  }
   // Drop steps whose status the host can't determine (status_key: null, e.g.
   // Pi/Qwen's credential step) WHEN there's a trackable step to anchor on.
   // Showing an untrackable step pre-install and then having it vanish once the

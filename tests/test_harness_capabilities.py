@@ -30,7 +30,6 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
-from omnigent.inner.devin import DEVIN_ACP_EXTENSION
 from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
@@ -78,19 +77,16 @@ def test_subagents_matches_its_implementing_mechanism() -> None:
 
     1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
        the vendor's own spawn and mints the child session.
-    2. An **ACP vendor extension** carrying a sub-agent dialect
-       (:mod:`omnigent.inner.devin`): the agent reports its sub-agent lifecycle in
-       its own ``_meta``, and the runner mints the child from that. No native
-       wrapper label is involved — deliberately, since the child inherits its
-       parent's harness identity rather than claiming a vendor's.
+    2. An **ACP vendor extension** carrying a sub-agent dialect: the agent
+       reports its sub-agent lifecycle in its own ``_meta`` and the runner mints
+       the child from that. No built-in row uses this today — the mechanism
+       stays for a community ACP plugin — so nothing is added below.
 
     Keeping the derivation here means a harness cannot publish a ``subagents``
     capability on ``/v1/harnesses`` that nothing implements, or implement one it
     does not publish.
     """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
-    if DEVIN_ACP_EXTENSION.surfaces_subagents:
-        subagent_capable.add("devin")
     for harness, capability in harness_capabilities().items():
         expected = harness in subagent_capable
         assert capability.subagents == expected, harness
@@ -371,6 +367,69 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
     assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
 
 
+def test_native_startup_additive_instruction_delivery() -> None:
+    for harness in ("claude-native", "codex-native", "pi-native"):
+        assert (
+            harness_capabilities()[harness].instruction_delivery
+            is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+        )
+
+
 def test_kiro_native_is_not_delivered() -> None:
     caps = harness_capabilities()
     assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_opencode_native_declares_v2_session_capabilities() -> None:
+    """OpenCode 2.x streams deltas and exposes steer/queue, images and compaction."""
+    capability = harness_capabilities()["opencode-native"]
+    assert capability.integration_mode is IntegrationMode.NATIVE_SERVER
+    assert capability.streaming is True
+    assert capability.steering is True
+    assert capability.live_queue is True
+    assert capability.images is True
+    assert capability.compaction is True
+    # Native fork is attempted when the source DB is reachable; otherwise
+    # history rides as a preamble.
+    assert capability.fork_history is ForkHistory.PREAMBLE
+    # v2 has no per-prompt system field; instructions ride the launch config.
+    assert capability.instruction_delivery is InstructionDelivery.COMPOSED_SESSION_SNAPSHOT
+    catalog = capability.as_dict()
+    assert catalog["streaming"] is True
+    assert catalog["instruction_delivery"] == "composed-session-snapshot"
+
+
+def test_opencode_native_streaming_claim_is_backed_by_v2_deltas() -> None:
+    """The streaming=True claim rests on real v2 delta events, not snapshots."""
+    from tests.opencode_v2_fixtures import events_of_type
+
+    assert events_of_type("session.text.delta"), "fixture lost its text deltas"
+    assert events_of_type("session.reasoning.delta"), "fixture lost its reasoning deltas"
+
+
+def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:
+    """A declared effort family puts a dial in the composer; the executor must use the pick.
+
+    The adapter forwards a session's ``reasoning_effort`` through
+    ``ExecutorConfig.extra`` and each SDK executor that honors it reads that key.
+    ``antigravity``'s executor does not, so its capability must stay NONE: a
+    GEMINI declaration would show a control whose selection changes nothing.
+    """
+    import inspect
+
+    from omnigent.inner import (
+        antigravity_executor,
+        claude_sdk_executor,
+        openai_agents_sdk_executor,
+    )
+
+    caps = harness_capabilities()
+    assert caps["antigravity"].effort is EffortFamily.NONE
+    assert "reasoning_effort" not in inspect.getsource(antigravity_executor)
+    # The SDK harnesses that DO declare a family read the forwarded value.
+    for harness, module in (
+        ("claude-sdk", claude_sdk_executor),
+        ("openai-agents", openai_agents_sdk_executor),
+    ):
+        assert caps[harness].effort is not EffortFamily.NONE, harness
+        assert "reasoning_effort" in inspect.getsource(module), harness

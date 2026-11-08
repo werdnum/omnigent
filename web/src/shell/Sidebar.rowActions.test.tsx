@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -6,16 +10,22 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import { useSyncExternalStore, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { sessionActionRestrictions, type SessionActionSource } from "@/lib/sessionCapabilities";
+
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: (_id: string, source: SessionActionSource) =>
+    sessionActionRestrictions(source),
+}));
 
 // Controllable rename mutation so the double-click test can assert the
 // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
@@ -71,71 +81,51 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-    variables: undefined,
-  }),
-  // Reactive server pinned set: subscribes to the hoisted store so a toggle
-  // re-renders, mapping pinned ids onto the loaded conversations.
-  usePinnedConversations: () => {
-    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
-    const idSet = new Set(ids);
-    return {
-      data: {
-        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
-        filterHonored: true,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    usePinnedConversations: () => {
+      const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+      const idSet = new Set(ids);
+      return {
+        data: {
+          conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+          filterHonored: true,
+        },
+        isSuccess: true,
+      };
+    },
+    useTogglePinnedConversation: () => ({
+      mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+        mocks.pinnedStore.toggle(id, pinned),
+      // Unpin goes through mutateAsync so the Undo pill waits for the write.
+      mutateAsync: ({ id, pinned }: { id: string; pinned: boolean }) => {
+        mocks.pinnedStore.toggle(id, pinned);
+        return Promise.resolve({});
       },
-      isSuccess: true,
-    };
-  },
-  useTogglePinnedConversation: () => ({
-    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      mocks.pinnedStore.toggle(id, pinned),
-  }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => mocks.rename,
-  useLeaveSession: () => mocks.leave,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({
-    data: mocks.projects.map((name: string) => ({
-      id: `p_${name}`,
-      name,
-      icon: mocks.projectIcons[name],
-    })),
-  }),
-  // A non-empty `useProjects` renders a project folder, which queries its
-  // sessions — return the collapsed (disabled) shape so the folder is inert
-  // (this suite keeps its test row unfiled; the picker only needs the name).
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  }),
-  useMoveToProject: () => mocks.moveToProject,
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useRenameConversation: () => mocks.rename,
+    useLeaveSession: () => mocks.leave,
+    useProjects: () => ({
+      data: mocks.projects.map((name: string) => ({
+        id: `p_${name}`,
+        name,
+        icon: mocks.projectIcons[name],
+      })),
+    }),
+    useProjectSessions: () => ({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+      error: null,
+      fetchNextPage: vi.fn(),
+      hasNextPage: false,
+      isFetchingNextPage: false,
+    }),
+    useMoveToProject: () => mocks.moveToProject,
+  };
+});
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
 // test stays scoped to the conversation row.
@@ -164,6 +154,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
+import { HeaderTitle } from "./HeaderTitle";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -233,26 +224,38 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
 // Route so `useParams` populates), making that row the active one — the
 // rest of the suite renders at `/` where no row is active. `info` pins the
 // server sharing policy via CapabilitiesProvider (default "loading" → on).
-function renderSidebar(activeId?: string, info?: ServerInfo) {
+function renderSidebar(
+  activeId?: string,
+  info?: ServerInfo,
+  { open = true, header }: { open?: boolean; header?: ReactElement } = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  let sidebarOpen = open;
   // Build a FRESH element tree per render: re-rendering the identical element
   // reference lets React bail out without re-invoking the sidebar, which
   // would swallow a `mockConversations` swap applied mid-test.
   const makeUi = () => {
-    const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
+    const sidebar = (
+      <>
+        <Sidebar open={sidebarOpen} onClose={vi.fn()} />
+        {header}
+      </>
+    );
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -262,7 +265,13 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
   const view = render(makeUi());
   // Re-render so a test can apply a new `mockConversations` list mid-flight
   // (e.g. simulating a reorder pushed between user clicks).
-  return Object.assign(view, { rerenderSidebar: () => view.rerender(makeUi()) });
+  return Object.assign(view, {
+    rerenderSidebar: () => view.rerender(makeUi()),
+    setSidebarOpen: (next: boolean) => {
+      sidebarOpen = next;
+      view.rerender(makeUi());
+    },
+  });
 }
 
 beforeEach(() => {
@@ -326,21 +335,15 @@ describe("quick pin/unpin hover button", () => {
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
-    // The folder-header pencil + kebab share the right-edge column with the
-    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
-    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
-    // different columns and read as misaligned.
+    // Project and session menu buttons share the same compact right-edge slot.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const projectActions = screen.getByTestId("project-actions");
-    const projectNewSession = screen.getByTestId("project-new-session");
-    for (const button of [projectActions, projectNewSession]) {
-      expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
-      expect(button).not.toHaveClass("size-7");
-      expect(button.querySelector("svg")).toHaveClass("size-3.5");
-      expect(button.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
-    }
+    expect(projectActions).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(projectActions).not.toHaveClass("size-7");
+    expect(projectActions.querySelector("svg")).toHaveClass("size-3.5");
+    expect(projectActions.querySelector("svg")).toHaveAttribute("data-icon-size", "14");
     // Same compact size as the session-row kebab it aligns with.
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
@@ -360,6 +363,15 @@ describe("quick pin/unpin hover button", () => {
       expect(button).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
       expect(button).not.toHaveClass("size-7");
     }
+  });
+
+  it("tints the new-project icon selector with the active theme accent", () => {
+    renderSidebar();
+    fireEvent.click(screen.getByTestId("new-project"));
+
+    const iconSelector = screen.getByTestId("new-project-icon");
+    expect(iconSelector).toHaveClass("bg-primary/10");
+    expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
   it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
@@ -437,6 +449,17 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.queryByText("Pinned")).toBeNull();
   });
 
+  it.each([
+    ["quick-pin-conversation", "Pin"],
+    ["quick-archive-conversation", "Archive"],
+  ])("shows the %s action in a styled tooltip on hover", async (testId, label) => {
+    const user = userEvent.setup();
+    renderSidebar();
+
+    await user.hover(screen.getByTestId(testId));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+  });
+
   it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
     renderSidebar();
 
@@ -508,6 +531,104 @@ describe("quick pin/unpin hover button", () => {
     const kebab = screen.getByTestId("conversation-actions");
     expect(kebab).toHaveClass("hidden", "md:inline-flex");
     expect(kebab).not.toHaveClass("md:block");
+  });
+});
+
+describe("rename shortcut", () => {
+  const pressRenameShortcut = () =>
+    fireEvent.keyDown(window, { code: "KeyR", ctrlKey: true, altKey: true });
+  const header = <HeaderTitle conversationId="conv_1" title="My Session" />;
+
+  it("edits the session's sidebar row, not the header title", () => {
+    renderSidebar("conv_1", undefined, { header });
+
+    pressRenameShortcut();
+
+    const input = screen.getByTestId("rename-conversation-input") as HTMLInputElement;
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, "My Session".length]);
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+    // Pressing it again keeps the open sidebar edit instead of starting a header one.
+    pressRenameShortcut();
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+    fireEvent.change(input, { target: { value: "Renamed Session" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename.mutate).toHaveBeenCalledExactlyOnceWith({
+      id: "conv_1",
+      title: "Renamed Session",
+    });
+  });
+
+  it("falls back to the header title while the sidebar is closed", () => {
+    renderSidebar("conv_1", undefined, { open: false, header });
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("moves an edit left open in a closed sidebar to the header title", () => {
+    const { setSidebarOpen } = renderSidebar("conv_1", undefined, { header });
+    pressRenameShortcut();
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+
+    setSidebarOpen(false);
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title while the session's project folder is collapsed", () => {
+    mocks.projects = ["Moonshot"];
+    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    renderSidebar(undefined, undefined, { header });
+    expect(screen.getByRole("button", { name: /^Moonshot/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("link", { name: /My Session/ })).toBeNull();
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
+  });
+
+  it("falls back to the header title in selection mode, then edits the row after it", () => {
+    renderSidebar("conv_1", undefined, { header });
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    const headerInput = screen.getByTestId("header-title-input");
+    expect(headerInput).toHaveFocus();
+    fireEvent.keyDown(headerInput, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
+
+    pressRenameShortcut();
+
+    expect(screen.getByTestId("rename-conversation-input")).toHaveFocus();
+    expect(screen.queryByTestId("header-title-input")).toBeNull();
+  });
+
+  it("falls back to the header title when the row belongs to someone else", () => {
+    mockConversations([{ ...CONV, owner: "someone-else@example.com" }]);
+    renderSidebar("conv_1", undefined, { header });
+    // Shared sessions list under the Shared filter.
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    expect(screen.getByRole("link", { name: /My Session/ })).toBeTruthy();
+
+    pressRenameShortcut();
+
+    expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
+    expect(screen.getByTestId("header-title-input")).toHaveFocus();
   });
 });
 
@@ -673,6 +794,83 @@ describe("double-click to rename", () => {
 
     expect(screen.queryByTestId("rename-conversation-input")).toBeNull();
     expect(mocks.rename.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("rename under the iOS soft keyboard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Stub the iOS shell on an 844px layout. The returned function raises the
+   * keyboard through UIKit's keyboard-viewport bridge or, for shells without
+   * it, through WebKit's shrinking visualViewport.
+   */
+  function stubIOSShell(source: "native" | "visualViewport"): (visibleHeight: number) => void {
+    const viewport = Object.assign(new EventTarget(), { height: 844, offsetTop: 0 });
+    let nativeViewport: { width: number; height: number } | null = null;
+    const nativeListeners = new Set<() => void>();
+    vi.stubGlobal("innerHeight", 844);
+    vi.stubGlobal("visualViewport", viewport);
+    vi.stubGlobal("omnigentNative", {
+      kind: "ios",
+      ...(source === "native" && {
+        getKeyboardViewport: () => nativeViewport,
+        onKeyboardViewportChanged: (callback: () => void) => {
+          nativeListeners.add(callback);
+          return () => nativeListeners.delete(callback);
+        },
+      }),
+    });
+    return (visibleHeight) => {
+      act(() => {
+        if (source === "native") {
+          nativeViewport = { width: window.innerWidth, height: visibleHeight };
+          nativeListeners.forEach((callback) => callback());
+        } else {
+          viewport.height = visibleHeight;
+          viewport.dispatchEvent(new Event("resize"));
+        }
+      });
+    };
+  }
+
+  it.each(["native", "visualViewport"] as const)(
+    "re-centers the focused rename field once the %s keyboard inset shrinks the list",
+    (source) => {
+      // The field focuses (raising the keyboard) while still visible; the
+      // drawer's keyboard-inset padding then shrinks the list underneath it.
+      const openKeyboard = stubIOSShell(source);
+      renderSidebar();
+      fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+      const input = screen.getByTestId("rename-conversation-input");
+      expect(input).toHaveFocus();
+      const scrollIntoView = vi.fn();
+      input.scrollIntoView = scrollIntoView;
+
+      openKeyboard(508);
+
+      expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveStyle({
+        paddingBottom: "336px",
+      });
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
+    },
+  );
+
+  it("re-centers a rename field that opens while the keyboard is already up", () => {
+    const openKeyboard = stubIOSShell("native");
+    renderSidebar();
+    openKeyboard(508);
+    const scrollIntoView = vi.spyOn(HTMLElement.prototype, "scrollIntoView");
+
+    fireEvent.dblClick(screen.getByRole("link", { name: /My Session/ }));
+
+    const input = screen.getByTestId("rename-conversation-input");
+    expect(input).toHaveFocus();
+    expect(scrollIntoView.mock.contexts).toContain(input);
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "center" });
   });
 });
 
@@ -1139,6 +1337,20 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("offers Fork for a managed source", () => {
+    mockConversations([{ ...CONV, labels: { "omnigent.host_type": "managed" } }]);
+    renderSidebar();
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    expect(screen.getByRole("menu")).toHaveClass("menu-surface");
+    const fork = screen.getByRole("menuitem", { name: "Fork" });
+    expect(fork).not.toHaveAttribute("aria-disabled");
+    fireEvent.click(fork);
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
   it("opens the fork dialog for the selected session", () => {
     renderSidebar();
 
@@ -1151,28 +1363,49 @@ describe("right-click context menu", () => {
     );
   });
 
-  it("opens the same action items as the kebab and drives the same handlers", () => {
-    renderSidebar();
+  it.each(["quick-pin-conversation", "quick-archive-conversation", "conversation-actions"])(
+    "opens the session menu when right-clicking the %s button",
+    (testId) => {
+      renderSidebar();
 
-    // Nothing in the DOM until the row is right-clicked (the kebab menu is
-    // closed, so its items aren't rendered either).
-    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+      expect(fireEvent.contextMenu(screen.getByTestId(testId))).toBe(false);
 
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    },
+  );
 
-    // The context menu carries the full set of kebab actions — same testids,
-    // so it renders from the shared ConversationMenuItems body.
-    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
-    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+  it.each(["kebab", "context"])(
+    "opens the shared actions from %s and drives their handlers",
+    (menu) => {
+      renderSidebar(undefined, serverInfo({ sibling_sessions: true }));
 
-    // Selecting Rename runs the same path as the kebab / double-click: the
-    // inline rename input appears.
-    fireEvent.click(screen.getByTestId("rename-conversation"));
-    expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
-  });
+      // Nothing in the DOM until the row is right-clicked (the kebab menu is
+      // closed, so its items aren't rendered either).
+      expect(screen.queryByTestId("rename-conversation")).toBeNull();
+
+      if (menu === "kebab") {
+        fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+      } else {
+        fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      }
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
+
+      // The context menu carries the full set of kebab actions — same testids,
+      // so it renders from the shared ConversationMenuItems body.
+      expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
+      expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+
+      // Selecting Rename runs the same path as the kebab / double-click: the
+      // inline rename input appears.
+      fireEvent.click(screen.getByTestId("rename-conversation"));
+      expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+    },
+  );
 
   it("holds the list order under the pointer so a right-click rename hits the aimed row", () => {
     // A right-click is a single event, so nothing can cross-check it like the
@@ -1356,11 +1589,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

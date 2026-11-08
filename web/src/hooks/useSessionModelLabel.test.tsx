@@ -30,6 +30,7 @@ interface Props {
   options: readonly NativeModelOption[];
   expectsCatalog: boolean;
   confirmed: boolean;
+  hostOptions?: readonly NativeModelOption[];
 }
 const defaults: Props = { scope, model, options: [], expectsCatalog: true, confirmed: true };
 const loading = { label: null, loading: true, unavailable: false };
@@ -44,6 +45,7 @@ function renderLabel(overrides: Partial<Props> = {}) {
         props.options,
         props.expectsCatalog,
         props.confirmed,
+        props.hostOptions,
       ),
     { initialProps: { ...defaults, ...overrides } },
   );
@@ -67,6 +69,124 @@ afterEach(() => {
 });
 
 describe("useSessionModelLabel", () => {
+  it.each(["alias-a", model])("uses an exact host id or wire-model match: %s", (reported) => {
+    const { result } = renderLabel({ model: reported, hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["codex-native", "codex", "native-codex"])(
+    "names an offline %s session's Unity Catalog model from the host catalog",
+    (harness) => {
+      const codexScope = { ...scope, harness };
+      const reported = "system.ai.gpt-5-6-sol";
+      const codexProps = { ...defaults, scope: codexScope, model: reported };
+      const key = getSessionModelLabelCacheKey(codexScope, reported);
+      expect(readSessionModelLabelCache(key)).toBeNull();
+
+      // An offline runner supplies no session catalog; the host probe arrives later.
+      const { result, rerender } = renderLabel(codexProps);
+      expect(result.current).toEqual(loading);
+      rerender({
+        ...codexProps,
+        hostOptions: [{ id: "gpt-5.6-sol", model: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" }],
+      });
+      const expected = { label: "GPT-5.6-Sol", loading: false, unavailable: false };
+      expect.soft(result.current).toEqual(expected);
+
+      act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+      expect.soft(result.current).toEqual(expected);
+      expect(readSessionModelLabelCache(key)).toBeNull();
+    },
+  );
+
+  it("prefers an exact Codex host match over an equivalent spelling", () => {
+    const { result } = renderLabel({
+      scope: { ...scope, harness: "codex-native" },
+      model: "system.ai.gpt-5-6-sol",
+      hostOptions: [
+        { id: "gpt-5.6-sol", displayName: "Codex name" },
+        { id: "system.ai.gpt-5-6-sol", displayName: "Exact name" },
+      ],
+    });
+    expect(result.current).toEqual({ label: "Exact name", loading: false, unavailable: false });
+  });
+
+  it.each([
+    ["gpt-6.1-sol", "GPT-6.1-Sol"],
+    ["system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
+    ["Session's custom name", "Session's custom name"],
+  ])("prefers a host name over the cached ID %s, preserving custom names", (cached, expected) => {
+    const reported = "system.ai.gpt-6-1-sol";
+    writeSessionModelLabelCache(getSessionModelLabelCacheKey(scope, reported), cached);
+    const { result } = renderLabel({
+      model: reported,
+      hostOptions: [{ id: "gpt-6.1-sol", displayName: "GPT-6.1-Sol" }],
+    });
+    expect(result.current.label).toBe(expected);
+  });
+
+  it.each([
+    ["codex-native", "system.ai.gpt-5-6-luna"],
+    ["codex-native", "system.ai.gpt-5-5-sol"],
+    ["claude-native", "system.ai.gpt-5-6-sol[1m]"],
+  ])("does not borrow a host name for %s reporting %s", (harness, reported) => {
+    const { result } = renderLabel({
+      scope: { ...scope, harness },
+      model: reported,
+      hostOptions: [{ id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" }],
+    });
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current).toEqual({ label: null, loading: false, unavailable: true });
+  });
+
+  it("does not retain a host name after the model changes or the host catalog disappears", () => {
+    const { result, rerender } = renderLabel({ hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    rerender({ ...defaults, model: "another-model", hostOptions: catalog });
+    expect(result.current).toEqual(loading);
+    rerender({ ...defaults, hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    rerender(defaults);
+    expect(result.current).toEqual(loading);
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current).toEqual({ label: null, loading: false, unavailable: true });
+    expect(readSessionModelLabelCache(cacheKey())).toBeNull();
+  });
+
+  it("uses a host entry's wire model when it has no display name", () => {
+    const { result } = renderLabel({
+      model: "alias-a",
+      hostOptions: [{ id: "alias-a", model }],
+    });
+    expect(result.current).toEqual({ label: model, loading: false, unavailable: false });
+  });
+
+  it("recovers from timeout with a host name without caching it, then prefers the session catalog", () => {
+    const { result, rerender } = renderLabel();
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current.unavailable).toBe(true);
+    const hostOptions = [{ ...catalog[0], displayName: "Host name" }];
+    rerender({ ...defaults, hostOptions });
+    expect(result.current).toEqual({ label: "Host name", loading: false, unavailable: false });
+    expect(readSessionModelLabelCache(cacheKey())).toBeNull();
+    rerender({ ...defaults, hostOptions, options: catalog });
+    expect(result.current).toEqual(named);
+    expect(readSessionModelLabelCache(cacheKey())).toBe(named.label);
+    rerender({ ...defaults, hostOptions });
+    expect(result.current).toEqual(named);
+  });
+
+  it("does not borrow a host name for a different model or override a populated session catalog", () => {
+    const hostOptions = [{ ...catalog[0], displayName: "Host name" }];
+    const { result, rerender } = renderLabel({ model: `${model}[1m]`, hostOptions });
+    expect(result.current).toEqual(loading);
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current.unavailable).toBe(true);
+    rerender({ ...defaults, hostOptions, options: [{ id: "another-model" }] });
+    expect(result.current).toEqual({ label: model, loading: false, unavailable: false });
+  });
+
   it("waits on a cold catalog, then renders and caches its exact display name", () => {
     const { result, rerender } = renderLabel();
     expect(result.current).toEqual(loading);
@@ -75,6 +195,29 @@ describe("useSessionModelLabel", () => {
     expect(readSessionModelLabelCache(cacheKey())).toBe(named.label);
   });
 
+  it.each([
+    ["codex-native", "gpt-6.1-sol", "system.ai.gpt-6-1-sol", "GPT-6.1-Sol"],
+    ["claude-native", "SYSTEM.AI.CLAUDE-SONNET-5", "claude-sonnet-5", "Sonnet 5"],
+    ["pi-native", "provider/GLM-5.3", "provider/glm-5.3", "GLM-5.3"],
+    ["cursor-native", "GEMINI-2.5-PRO", "gemini-2.5-pro", "Gemini 2.5 Pro"],
+  ])(
+    "keeps %s names consistent across host, live and cached catalogs",
+    (harness, reported, id, label) => {
+      const props = { ...defaults, scope: { ...scope, harness }, model: reported };
+      const options = [{ id, model: id, displayName: label }];
+      const expected = { label, loading: false, unavailable: false };
+      const { result, rerender, unmount } = renderLabel({ ...props, hostOptions: options });
+      expect(result.current).toEqual(expected);
+      rerender({ ...props, options });
+      expect(result.current).toEqual(expected);
+      expect(readSessionModelLabelCache(getSessionModelLabelCacheKey(props.scope, reported))).toBe(
+        label,
+      );
+      unmount();
+      expect(renderLabel(props).result.current).toEqual(expected);
+    },
+  );
+
   it("renders synchronously from storage after a remount with no catalog", () => {
     const first = renderLabel({ options: catalog });
     first.unmount();
@@ -82,6 +225,45 @@ describe("useSessionModelLabel", () => {
     expect(second.result.current).toEqual(named);
     act(() => vi.advanceTimersByTime(0));
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["codex-native", "system.ai.gpt-6-astra", "system.ai.gpt-6-astra"],
+    ["pi-native", "omnigent-openai/system.ai.gpt-6-astra", "system.ai.gpt-6-astra"],
+    ["claude-native", "opus", "system.ai.claude-opus-5"],
+  ])("keeps %s labels formatted across catalog loss and reload", (harness, id, wireModel) => {
+    const props = { ...defaults, scope: { ...scope, harness }, model: id };
+    const expected = wireModel.slice("system.ai.".length);
+    const first = renderLabel({
+      ...props,
+      options: [{ id, model: harness === "pi-native" ? id : wireModel, displayName: wireModel }],
+    });
+    expect(first.result.current.label).toBe(expected);
+    first.rerender(props);
+    expect(first.result.current).toEqual({ label: expected, loading: false, unavailable: false });
+    first.unmount();
+    expect(renderLabel(props).result.current.label).toBe(expected);
+  });
+
+  it.each(["system.ai.gpt-6-astra", "omnigent-openai/system.ai.gpt-6-astra"])(
+    "formats an existing raw cached label for %s before metadata arrives",
+    (reported) => {
+      const key = getSessionModelLabelCacheKey(scope, reported);
+      writeSessionModelLabelCache(key, "system.ai.gpt-6-astra");
+      const { result } = renderLabel({ model: reported });
+      expect(result.current).toEqual({
+        label: "gpt-6-astra",
+        loading: false,
+        unavailable: false,
+      });
+    },
+  );
+
+  it("preserves deliberate cached display names with catalog prefixes", () => {
+    const reported = "omnigent-openai/system.ai.gpt-6-astra";
+    const label = "system.ai.gpt-6-astra (team)";
+    writeSessionModelLabelCache(getSessionModelLabelCacheKey(scope, reported), label);
+    expect(renderLabel({ model: reported }).result.current.label).toBe(label);
   });
 
   it("discovers a warm cache as soon as delayed identity resolves, without an external rerender", async () => {

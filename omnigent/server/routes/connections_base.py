@@ -25,6 +25,7 @@ import jwt
 from fastapi import APIRouter, Request
 from starlette.responses import RedirectResponse
 
+from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -69,7 +70,7 @@ class ConnectionHooks(Protocol):
         """Non-secret, provider-specific ``status`` fields (never tokens)."""
 
     def begin(self, request: Request, build_state: Any) -> ConnectStart | None:
-        """Start authorization. ``build_state(extra_claims)`` returns a signed
+        """Start authorization in a worker thread. ``build_state(extra_claims)`` returns a signed
         state string carrying ``extra_claims`` alongside the shared ones. Return
         ``None`` on bad input (e.g. a missing/invalid workspace)."""
 
@@ -154,9 +155,14 @@ def create_connection_router(
                 "exp": int(time.time()) + _STATE_TTL_S,
                 **extra_claims,
             }
+            payload["account_generation"] = account_generation(user_id)
             return jwt.encode(payload, key, algorithm=_STATE_ALG)
 
-        start = hooks.begin(request, build_state)
+        try:
+            start = await asyncio.to_thread(hooks.begin, request, build_state)
+        except ConnectionError as exc:
+            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            return redirect_with_status(provider, clamped, "error")
         if start is None:
             return redirect_with_status(provider, clamped, "error")
         return RedirectResponse(url=start.authorize_url, status_code=302)
@@ -172,15 +178,24 @@ def create_connection_router(
         state's ``return_to`` with a ``?<provider>=connected|error`` marker.
         """
         user_id = _current_user(request)
+        # Failure fallbacks have no valid state carrying the client's return_to,
+        # so they use the local default; keep it under a subpath mount (the
+        # client-set return_to already carries the prefix).
+        base_path = getattr(request.app.state, "base_path", "")
+        default_return_to = f"{base_path}{_DEFAULT_RETURN_TO}"
         if not code or not state:
-            return redirect_with_status(provider, _DEFAULT_RETURN_TO, "error")
+            return redirect_with_status(provider, default_return_to, "error")
         try:
             claims = _verify_state(state)
         except jwt.PyJWTError:
             _logger.warning("%s callback with invalid state", provider)
-            return redirect_with_status(provider, _DEFAULT_RETURN_TO, "error")
+            return redirect_with_status(provider, default_return_to, "error")
         return_to = sanitize_return_to(claims.get("return_to"))
-        if claims.get("sub") != user_id:
+        if return_to == _DEFAULT_RETURN_TO:
+            return_to = default_return_to
+        if claims.get("sub") != user_id or claims.get("account_generation") != account_generation(
+            user_id
+        ):
             _logger.warning("%s callback state/user mismatch", provider)
             return redirect_with_status(provider, return_to, "error")
         try:

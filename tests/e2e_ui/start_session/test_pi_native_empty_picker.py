@@ -75,7 +75,9 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
                     body=json.dumps({"models": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/pi-native/model-options",
                 handle_pi_model_options,
@@ -102,9 +104,7 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
             await expect(models).to_be_visible()
             await expect(models).to_contain_text("Models unavailable")
             await expect(models.get_by_role("menuitemcheckbox")).to_have_count(0)
-            await expect(
-                page.get_by_test_id("new-chat-landing-agent-model-search")
-            ).to_be_visible()
+            await expect(models.get_by_role("textbox", name="Search models")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-agent-efforts")).to_contain_text(
                 "Thinking level"
             )

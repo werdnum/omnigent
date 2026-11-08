@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING
 from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.transports.ws_tunnel.frames import (
     WSCloseFrame,
     WSFrame,
@@ -74,6 +74,17 @@ class WrongReplicaWSError(RuntimeError):
     internal-error close, which the client treats as a dead-end. Subclasses
     ``RuntimeError`` so existing ``except Exception`` fallbacks that close
     ``4500`` still catch it.
+    """
+
+
+class RunnerUnavailableWSError(RuntimeError):
+    """Raised by the tunnel factory when the pinned runner's tunnel is not connected.
+
+    The session is bound to a runner whose tunnel is absent
+    (``RUNNER_UNAVAILABLE``), e.g. while it reconnects after a server or
+    runner restart. The terminal-attach route maps it to WS close code
+    ``1013`` so the client re-dials with backoff instead of dead-ending on
+    the generic ``4500``.
     """
 
 
@@ -163,12 +174,16 @@ def make_tunnel_ws_factory(
         try:
             routed = router.client_for_existing_conversation(conversation_id)
         except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise WrongReplicaWSError(str(exc)) from exc
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                raise RunnerUnavailableWSError(str(exc)) from exc
             raise RuntimeError(str(exc)) from exc
         if routed is None:
             raise RuntimeError(f"no runner pinned for conversation {conversation_id!r}")
         session = registry.get(routed.runner_id)
         if session is None:
-            raise RuntimeError(
+            raise RunnerUnavailableWSError(
                 f"runner {routed.runner_id!r} is offline for conversation {conversation_id!r}"
             )
         return _TunneledWSConn(

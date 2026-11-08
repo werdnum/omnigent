@@ -15,18 +15,23 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-from sqlalchemy import Engine, or_, select, tuple_, update
+from sqlalchemy import Engine, case, or_, select, true, tuple_, update
 from sqlalchemy import delete as sql_delete
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account, session_account_owner_query
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlPreference,
+    SqlScheduledTask,
+    SqlSessionPermission,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
@@ -36,6 +41,7 @@ from omnigent.db.utils import (
     now_epoch,
     run_write_transaction,
 )
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
@@ -48,6 +54,13 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
+
+# Expire recovery ownership after a minute without renewal.
+_MANAGED_RECOVERY_LEASE_S = 60
+
+
+class _HostOwnershipError(IntegrityError):
+    """An ownership refusal, not a retryable insert conflict."""
 
 
 @dataclass
@@ -98,6 +111,7 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    account_generation: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -171,6 +185,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
+        account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -189,6 +204,91 @@ def hash_host_launch_token(token: str) -> str:
     :returns: Hex SHA-256 digest, e.g. ``"9f86d08..."`` (64 chars).
     """
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _delete_host_row(session: Session, row: SqlHost) -> None:
+    session.delete(row)
+    session.execute(
+        sql_delete(SqlPreference).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == "__host_lifecycle__",
+            SqlPreference.key.in_(["recovery:" + row.host_id, "retained_sandbox:" + row.host_id]),
+        )
+    )
+
+
+def delete_host_in_session(session: Session, row: SqlHost) -> Host:
+    """Delete an already locked host while retaining pending provider cleanup."""
+    host_id = row.host_id
+    deleted = _row_to_host(row)
+    session.execute(
+        update(SqlConversationMetadata)
+        .where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.host_id == host_id,
+        )
+        .values(host_id=None)
+    )
+    if row.sandbox_provider is None or (
+        row.sandbox_id is None and row.terminating_sandbox_id is None
+    ):
+        _delete_host_row(session, row)
+        return deleted
+    row.token_hash = None
+    row.token_expires_at = None
+    row.status = encode_host_status("offline")
+    row.deleted_at = row.deleted_at or now_epoch()
+    return _row_to_host(row)
+
+
+def lock_host_for_binding(session: Session, host_id: str | None) -> None:
+    """Serialize new bindings with automatic sandbox teardown."""
+    if host_id is None:
+        return
+    host = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+    # Legacy/imported sessions can record an unregistered host; launch admission
+    # still requires a registered host. A tombstone can never accept new work.
+    if host is not None and host.deleted_at is not None:
+        raise OmnigentError("Host is being deleted", code=ErrorCode.CONFLICT)
+
+
+def delete_unused_host_in_session(session: Session, row: SqlHost) -> Host | None:
+    """Claim teardown under the host lock only after every binding is released."""
+    if row.sandbox_provider is None or host_has_bindings_in_session(session, row):
+        return None
+    return delete_host_in_session(session, row)
+
+
+def host_has_bindings_in_session(session: Session, row: SqlHost) -> bool:
+    """Check session and retained-task bindings while holding the host lock."""
+    from omnigent.db.enum_codecs import encode_scheduled_task_state
+
+    # Current reads see admissions committed after a MySQL REPEATABLE READ snapshot.
+    retained = session.get(
+        SqlPreference,
+        (current_workspace_id(), "__host_lifecycle__", "retained_sandbox:" + row.host_id),
+        with_for_update=True,
+        populate_existing=True,
+    )
+    if retained is not None:
+        task = session.get(
+            SqlScheduledTask,
+            (current_workspace_id(), retained.value),
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if task is not None and task.state != encode_scheduled_task_state("deleted"):
+            return True
+    bound = session.scalar(
+        select(SqlConversationMetadata.id)
+        .where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.host_id == row.host_id,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    return bound is not None
 
 
 class HostStore:
@@ -283,6 +383,7 @@ class HostStore:
         )
 
         def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -313,8 +414,8 @@ class HostStore:
                     raise ValueError("managed host registration disappeared")
                 return _row_to_host(managed_row)
 
-            # Primary lookup: by (workspace_id, host_id) — the new PK.
-            row = session.get(SqlHost, (current_workspace_id(), host_id))
+            # Read after any pending disconnect so the ORM restores online status.
+            row = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
             if row is not None:
                 if row.deleted_at is not None:
                     raise ValueError("host has been deleted")
@@ -322,7 +423,7 @@ class HostStore:
                 # user's host_id. Raise the same IntegrityError the old UNIQUE
                 # constraint produced so the tunnel handler rejects the hijack.
                 if row.user_id != user_id and not allow_host_id_reown:
-                    raise IntegrityError(
+                    raise _HostOwnershipError(
                         "host_id already owned by a different user",
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
@@ -330,6 +431,7 @@ class HostStore:
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
                 row.user_id = user_id
+                row.account_generation = generation
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
@@ -347,6 +449,7 @@ class HostStore:
                     host_id=host_id,
                     name=name,
                     user_id=user_id,
+                    generation=generation,
                     now=now,
                     configured_harnesses_json=harnesses_json,
                 )
@@ -377,6 +480,7 @@ class HostStore:
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -388,7 +492,14 @@ class HostStore:
             session.add(row)
             return _row_to_host(row)
 
-        return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        try:
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+        except _HostOwnershipError:
+            raise
+        except IntegrityError:
+            # A concurrent reservation or connection can win the first insert.
+            # Retry in a fresh transaction, rechecking ownership and deletion.
+            return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
 
     @staticmethod
     def _rotate_host_id(
@@ -423,6 +534,7 @@ class HostStore:
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
         user_id = row.user_id
+        generation = row.account_generation
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
@@ -459,6 +571,7 @@ class HostStore:
         session.flush()
 
         new_row = SqlHost(
+            account_generation=generation,
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
             user_id=user_id,
@@ -496,6 +609,7 @@ class HostStore:
         host_id: str,
         name: str,
         user_id: str,
+        generation: str | None,
         now: int,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
@@ -544,6 +658,7 @@ class HostStore:
             )
             .values(
                 user_id=user_id,
+                account_generation=generation,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
@@ -557,12 +672,13 @@ class HostStore:
             status="online",
             created_at=created_at,
             updated_at=now,
+            account_generation=generation,
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
         )
 
-    def set_offline(self, host_id: str) -> None:
+    def set_offline(self, host_id: str, *, cancelled: Callable[[], bool] | None = None) -> None:
         """
         Mark a host as offline when its WebSocket disconnects.
 
@@ -571,18 +687,23 @@ class HostStore:
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param cancelled: Optional abandonment check after acquiring the row lock.
         """
         updated_at = now_epoch()
 
         def write(session: Session) -> None:
             row = session.execute(
-                select(SqlHost).where(
+                select(SqlHost)
+                .where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
                     SqlHost.deleted_at.is_(None),
                 )
+                .with_for_update()
             ).scalar_one_or_none()
-            if row is not None:
+            # A timed-out worker must not write after a reconnect. Once locked,
+            # any later reconnect waits for this transaction to finish.
+            if row is not None and not (cancelled is not None and cancelled()):
                 row.status = encode_host_status("offline")
                 row.updated_at = updated_at
 
@@ -617,7 +738,15 @@ class HostStore:
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
 
-    def heartbeat(self, host_id: str) -> None:
+    def heartbeat(
+        self,
+        host_id: str,
+        *,
+        managed_token: str | None = None,
+        token_ttl_s: int | None = None,
+        observed_at: int | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
         """
         Refresh a host's last-seen timestamp while its tunnel is alive.
 
@@ -627,18 +756,27 @@ class HostStore:
         ``PING_INTERVAL_S``. Does not change ``status`` — a host whose
         ping loop is running is, by construction, still ``"online"``.
 
-        No-op if the host does not exist.
+        A managed tunnel also renews its current launch token. Only an already
+        authenticated connection may request renewal, including after expiry;
+        new connections must still pass :meth:`resolve_launch_token`.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param managed_token: Credential accepted when this tunnel connected.
+            Guards against renewing a revoked or replaced sandbox generation.
+        :param token_ttl_s: Provider's validity window when renewal is due.
+            ``None`` persists only liveness, keeping the existing expiry.
+        :param observed_at: Timestamp captured before dispatching the heartbeat.
+        :param cancelled: Whether the originating tunnel abandoned this write.
         """
-        # Single UPDATE rather than SELECT-then-mutate: this runs every
-        # ping interval for every connected host, so the extra read is
-        # pure overhead. A missing host simply matches no rows (a no-op).
-        updated_at = now_epoch()
+        if token_ttl_s is not None and (managed_token is None or token_ttl_s <= 0):
+            raise ValueError("token renewal requires a managed token and a positive TTL")
+        updated_at = now_epoch() if observed_at is None else observed_at
 
         def write(session: Session) -> None:
-            session.execute(
+            if cancelled is not None and cancelled():
+                return
+            statement = (
                 update(SqlHost)
                 .where(
                     SqlHost.workspace_id == current_workspace_id(),
@@ -647,6 +785,34 @@ class HostStore:
                 )
                 .values(updated_at=updated_at)
             )
+            if managed_token is not None:
+                statement = statement.where(
+                    SqlHost.token_hash == hash_host_launch_token(managed_token),
+                    SqlHost.token_expires_at.is_not(None),
+                    SqlHost.status == encode_host_status("online"),
+                    SqlHost.sandbox_provider.is_not(None),
+                    SqlHost.sandbox_id.is_not(None),
+                    or_(
+                        SqlHost.terminating_sandbox_id.is_(None),
+                        SqlHost.terminating_sandbox_id != SqlHost.sandbox_id,
+                    ),
+                )
+                if token_ttl_s is not None:
+                    row = session.get(SqlHost, (current_workspace_id(), host_id))
+                    if row is None:
+                        return
+                    require_active_account(session, row.user_id, generation=row.account_generation)
+                    expires_at = updated_at + token_ttl_s
+                    statement = statement.values(
+                        token_expires_at=case(
+                            (SqlHost.token_expires_at < expires_at, expires_at),
+                            else_=SqlHost.token_expires_at,
+                        )
+                    )
+            session.execute(statement)
+            # UPDATE may wait for a row lock after the tunnel has disconnected.
+            if cancelled is not None and cancelled():
+                session.rollback()
 
         run_write_transaction(self._session_immediate, "update_host_heartbeat", write)
 
@@ -808,12 +974,13 @@ class HostStore:
             rows = session.execute(stmt).scalars().all()
             return [(row.workspace_id, _row_to_host(row)) for row in rows]
 
-    def get_host(self, host_id: str) -> Host | None:
+    def get_host(self, host_id: str, *, include_deleted: bool = False) -> Host | None:
         """
         Fetch a single host by ID.
 
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param include_deleted: Also return tombstoned hosts awaiting sandbox cleanup.
         :returns: The :class:`Host` if found, otherwise ``None``.
         """
         with self._session("select_host_by_id") as session:
@@ -821,12 +988,151 @@ class HostStore:
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
-                    SqlHost.deleted_at.is_(None),
+                    true() if include_deleted else SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is None:
                 return None
             return _row_to_host(row)
+
+    def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
+        """
+        Whether a host row already holds *host_id*, or *name* for *user_id*.
+
+        Counts deleted hosts still awaiting sandbox cleanup: their rows keep
+        both keys, so registering a new host under either would fail.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param user_id: The would-be owner, e.g. ``"alice@example.com"``.
+        :param name: The would-be display name, e.g. ``"managed-a1b2c3d4"``.
+        :returns: ``True`` when either key is taken in this workspace.
+        """
+        with self._session("select_host_identity_taken") as session:
+            row = session.execute(
+                select(SqlHost.host_id)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    or_(
+                        SqlHost.host_id == host_id,
+                        (SqlHost.user_id == user_id) & (SqlHost.name == name),
+                    ),
+                )
+                .limit(1)
+            ).first()
+            return row is not None
+
+    def reserve_sandbox_host(
+        self, *, host_id: str, name: str, user_id: str, provider: str
+    ) -> Host | None:
+        """Classify a self-registering sandbox before provisioning starts.
+
+        New reservations are offline and have no launch token. A connection
+        arriving after a launch timeout retains this classification. Existing
+        rows keep their liveness, credentials, identity and sandbox binding.
+        Returns None for a deleted host, a conflicting provider or a name
+        already held by another identity for this owner.
+        """
+
+        def write(session: Session) -> Host | None:
+            generation = require_active_account(session, user_id)
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                name_owner = session.execute(
+                    select(SqlHost.host_id).where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.user_id == user_id,
+                        SqlHost.name == name,
+                    )
+                ).scalar_one_or_none()
+                if name_owner is not None and name_owner != host_id:
+                    return None
+                now = now_epoch()
+                row = SqlHost(
+                    account_generation=generation,
+                    user_id=user_id,
+                    name=name,
+                    host_id=host_id,
+                    status=encode_host_status("offline"),
+                    created_at=now,
+                    updated_at=now,
+                    sandbox_provider=provider,
+                )
+                session.add(row)
+            else:
+                if row.deleted_at is not None:
+                    return None
+                if row.user_id != user_id:
+                    raise ValueError(
+                        f"host {host_id!r} is registered to a different user; "
+                        "refusing to reserve it"
+                    )
+                require_active_account(session, user_id, generation=row.account_generation)
+                if row.sandbox_provider not in {None, provider}:
+                    return None
+                row.sandbox_provider = provider
+            return _row_to_host(row)
+
+        try:
+            return run_write_transaction(self._lifecycle_session, "reserve_sandbox_host", write)
+        except IntegrityError:
+            # A host connection can insert after our missing-row read. Retry
+            # under the lifecycle lock; ownership and provider checks still apply.
+            return run_write_transaction(self._lifecycle_session, "reserve_sandbox_host", write)
+
+    def bind_sandbox(self, host_id: str, *, provider: str, sandbox_id: str) -> Host | None:
+        """Attach a provider's sandbox ID without changing credentials or reviving a host.
+
+        Call after provisioning, before waiting for a self-registering host.
+        Missing, deleted or conflicting bindings fail closed. A new sandbox on
+        a non-live row starts its reaping grace explicitly offline; live hosts
+        and repeated bindings keep their existing liveness and timestamps.
+        """
+
+        def write(session: Session) -> Host | None:
+            owner = session.execute(
+                select(SqlHost.user_id, SqlHost.account_generation).where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+            ).one_or_none()
+            if owner is None:
+                return None
+            # Lock the account before the host, matching account deletion.
+            require_active_account(session, owner.user_id, generation=owner.account_generation)
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or row.deleted_at is not None:
+                return None
+            if (row.user_id, row.account_generation) != tuple(owner):
+                return None
+            if row.terminating_sandbox_id == sandbox_id:
+                return None
+            if row.sandbox_provider not in {None, provider}:
+                return None
+            if row.sandbox_id not in {None, sandbox_id}:
+                return None
+            now = now_epoch()
+            if row.sandbox_id is None and not host_is_live(_row_to_host(row), now=now):
+                row.status = encode_host_status("offline")
+                row.updated_at = now
+            row.sandbox_provider = provider
+            row.sandbox_id = sandbox_id
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "bind_host_sandbox", write)
 
     def register_managed_host(
         self,
@@ -869,7 +1175,9 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
 
         def write(session: Session) -> Host:
+            generation = require_active_account(session, user_id)
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -886,6 +1194,85 @@ class HostStore:
 
         return run_write_transaction(self._session_immediate, "register_managed_host", write)
 
+    def claim_managed_recovery(self, host: Host, token: str) -> bool:
+        """Lease recovery by host identity, so siblings and replicas share one launch."""
+
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlHost, (current_workspace_id(), host.host_id), with_for_update=True
+            )
+            if row is None or row.deleted_at is not None:
+                raise ValueError(f"managed host {host.host_id!r} no longer exists")
+            key = (current_workspace_id(), "__host_lifecycle__", "recovery:" + host.host_id)
+            lease = session.get(SqlPreference, key)
+            value = json.loads(lease.value) if lease is not None else {}
+            if value.get("expires", 0) > now_epoch():
+                return False
+            if row.sandbox_id != host.sandbox_id:
+                if value.get("workspace") and value.get("sandbox_id") == row.sandbox_id:
+                    return False
+                raise ValueError("Sandbox changed before recovery; retry with its current state")
+            value = json.dumps(
+                {"token": token, "expires": now_epoch() + _MANAGED_RECOVERY_LEASE_S}
+            )
+            if lease is None:
+                session.add(
+                    SqlPreference(workspace_id=key[0], user_id=key[1], key=key[2], value=value)
+                )
+            else:
+                lease.value = value
+            return True
+
+        return run_write_transaction(self._lifecycle_session, "claim_managed_recovery", write)
+
+    def update_managed_recovery(
+        self,
+        host_id: str,
+        token: str,
+        *,
+        finished: bool = False,
+        workspace: str | None = None,
+        sandbox_id: str | None = None,
+    ) -> bool:
+        """Renew or finish only this lease, retaining the result for waiting siblings."""
+
+        def write(session: Session) -> bool:
+            host = session.get(SqlHost, (current_workspace_id(), host_id), with_for_update=True)
+            lease = session.get(
+                SqlPreference,
+                (current_workspace_id(), "__host_lifecycle__", "recovery:" + host_id),
+            )
+            if host is None or host.deleted_at is not None or lease is None:
+                return False
+            value = json.loads(lease.value)
+            # A canceled heartbeat's database write can finish after completion.
+            if value.get("token") != token or value.get("expires", 0) == 0:
+                return False
+            if finished:
+                value.update(expires=0, workspace=workspace, sandbox_id=sandbox_id)
+            else:
+                value["expires"] = now_epoch() + _MANAGED_RECOVERY_LEASE_S
+            lease.value = json.dumps(value)
+            return True
+
+        return run_write_transaction(self._lifecycle_session, "update_managed_recovery", write)
+
+    def managed_recovery_result(self, host_id: str) -> tuple[str, str] | None:
+        with self._session("read_managed_recovery") as session:
+            host = session.get(SqlHost, (current_workspace_id(), host_id))
+            lease = session.get(
+                SqlPreference,
+                (current_workspace_id(), "__host_lifecycle__", "recovery:" + host_id),
+            )
+            if host is None or host.deleted_at is not None or lease is None:
+                raise ValueError("Sandbox recovery is no longer available; retry the request")
+            value = json.loads(lease.value)
+            if value.get("workspace") and value.get("sandbox_id") == host.sandbox_id:
+                return value["workspace"], value["sandbox_id"]
+            if value.get("expires", 0) <= now_epoch():
+                raise ValueError("Sandbox recovery failed or expired; retry the request")
+            return None
+
     def replace_managed_host_sandbox(
         self,
         *,
@@ -895,6 +1282,8 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        recovery_token: str | None = None,
+        expected_host: Host | None = None,
     ) -> Host | None:
         """Replace the sandbox generation backing an existing managed host.
 
@@ -905,6 +1294,7 @@ class HostStore:
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
         with self._lifecycle_session("replace_managed_host_sandbox") as session:
+            require_active_account(session, user_id)
             existing = session.execute(
                 select(SqlHost)
                 .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
@@ -912,8 +1302,21 @@ class HostStore:
             ).scalar_one_or_none()
             if existing is None:
                 return None
+            if expected_host is not None and (
+                existing.sandbox_provider != expected_host.sandbox_provider
+                or existing.sandbox_id != expected_host.sandbox_id
+            ):
+                raise ValueError("another launch replaced this sandbox generation")
             if existing.deleted_at is not None:
                 return None
+            if recovery_token is not None:
+                lease = session.get(
+                    SqlPreference,
+                    (current_workspace_id(), "__host_lifecycle__", "recovery:" + host_id),
+                )
+                if lease is None or json.loads(lease.value).get("token") != recovery_token:
+                    raise ValueError("managed recovery lease was superseded")
+            require_active_account(session, user_id, generation=existing.account_generation)
             if existing.user_id != user_id:
                 raise ValueError(
                     f"host {host_id!r} is registered to a different user; "
@@ -934,6 +1337,7 @@ class HostStore:
             existing.token_expires_at = token_expires_at
             existing.sandbox_provider = provider
             existing.sandbox_id = sandbox_id
+            existing.status = encode_host_status("offline")
             existing.updated_at = now
             return _row_to_host(existing)
 
@@ -954,7 +1358,13 @@ class HostStore:
         longer current and the provider must not be asked to resume that sandbox id.
         """
         now = now_epoch()
-        with self._session("rearm_managed_host") as session:
+        with self._lifecycle_session("rearm_managed_host") as session:
+            snapshot = session.get(SqlHost, (current_workspace_id(), host_id))
+            if snapshot is None:
+                return None
+            require_active_account(
+                session, snapshot.user_id, generation=snapshot.account_generation
+            )
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -1025,7 +1435,91 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
-    def delete_host(self, host_id: str) -> Host | None:
+    def admit_launch(
+        self,
+        host_id: str,
+        session_id: str,
+        owner: str | None,
+        generation: str | None,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+        *,
+        require_account_owner: bool = False,
+    ) -> None:
+        """Order final launch authorization with account deletion across replicas.
+
+        An authorized transfer may still carry the source host binding captured
+        during resolution. Same-host restarts must not opt into this exception.
+        Accounts deployments also require a live session owner able to mint
+        runner credentials; other auth modes retain their own owner lifecycle.
+        """
+
+        def write(session: Session) -> None:
+            owner_query = (
+                session_account_owner_query()
+                .where(SqlSessionPermission.conversation_id == session_id)
+                .limit(1)
+            )
+            session_owner = (
+                session.execute(owner_query).one_or_none() if require_account_owner else None
+            )
+            related = (
+                {session_owner.session_owner: session_owner.session_generation}
+                if session_owner is not None
+                else None
+            )
+            require_active_account(session, owner, generation=generation, related_accounts=related)
+            if require_account_owner and (
+                session_owner is None
+                or session.execute(owner_query.with_for_update()).one_or_none() != session_owner
+            ):
+                raise OmnigentError(
+                    "session no longer has an active account owner", code=ErrorCode.UNAUTHORIZED
+                )
+            host = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if (
+                host is None
+                or host.deleted_at is not None
+                or (owner is not None and host.user_id != owner)
+            ):
+                raise OmnigentError("host is no longer available", code=ErrorCode.UNAUTHORIZED)
+            meta = session.execute(
+                select(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == session_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if meta is None or (
+                meta.host_id != host_id
+                and not (allow_unbound and meta.host_id is None)
+                and not (
+                    transfer_from_host_id is not None and meta.host_id == transfer_from_host_id
+                )
+            ):
+                raise OmnigentError(
+                    "session is no longer bound to this host", code=ErrorCode.UNAUTHORIZED
+                )
+            if meta.inference_snapshot is not None and host.sandbox_provider is None:
+                raise OmnigentError(
+                    "This session has a saved sandbox inference profile. "
+                    "Choose a managed sandbox host or start a new session to use this host.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
+
+    def delete_host(
+        self, host_id: str, *, keep_if_bound: bool = False, expected_host: Host | None = None
+    ) -> Host | None:
         """
         Logically delete a host and retain pending sandbox cleanup.
 
@@ -1036,7 +1530,10 @@ class HostStore:
         deletion with managed-host generation replacement.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
-        :returns: The latest host snapshot, or ``None`` when already absent.
+        :param keep_if_bound: Preserve the host while any conversation or retained
+            task in this workspace remains bound to it, including archived sessions.
+        :param expected_host: Refuse deletion if the sandbox generation has changed.
+        :returns: The latest host snapshot, or ``None`` when absent or preserved.
         """
 
         def write(session: Session) -> Host | None:
@@ -1050,30 +1547,14 @@ class HostStore:
             ).scalar_one_or_none()
             if row is None:
                 return None
-            deleted = _row_to_host(row)
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.host_id == host_id,
-                )
-                .values(host_id=None)
-            )
-            if row.sandbox_provider is None or (
-                row.sandbox_id is None and row.terminating_sandbox_id is None
+            if expected_host is not None and (
+                row.sandbox_provider != expected_host.sandbox_provider
+                or row.sandbox_id != expected_host.sandbox_id
             ):
-                session.execute(
-                    sql_delete(SqlHost).where(
-                        SqlHost.workspace_id == current_workspace_id(),
-                        SqlHost.host_id == host_id,
-                    )
-                )
-                return deleted
-            row.token_hash = None
-            row.token_expires_at = None
-            row.status = encode_host_status("offline")
-            row.deleted_at = row.deleted_at or now_epoch()
-            return _row_to_host(row)
+                return None
+            if keep_if_bound and host_has_bindings_in_session(session, row):
+                return None
+            return delete_host_in_session(session, row)
 
         return run_write_transaction(self._lifecycle_session, "delete_host", write)
 
@@ -1083,6 +1564,7 @@ class HostStore:
         *,
         sandbox_id: str,
         expected_updated_at: int,
+        expected_token: str | None = None,
     ) -> bool:
         """Atomically detach one stale generation before provider termination.
 
@@ -1109,6 +1591,12 @@ class HostStore:
                         SqlHost.sandbox_provider.is_not(None),
                         SqlHost.deleted_at.is_(None),
                         SqlHost.terminating_sandbox_id.is_(None),
+                        SqlHost.token_hash == hash_host_launch_token(expected_token)
+                        if expected_token
+                        else true(),
+                        SqlHost.status == encode_host_status("offline")
+                        if expected_token
+                        else true(),
                     )
                     .values(
                         token_hash=None,
@@ -1161,7 +1649,7 @@ class HostStore:
             if row.terminating_sandbox_id == sandbox_id:
                 row.terminating_sandbox_id = None
             if row.sandbox_id is None and row.terminating_sandbox_id is None:
-                session.delete(row)
+                _delete_host_row(session, row)
             return True
 
     def revoke_launch_token(self, host_id: str) -> None:

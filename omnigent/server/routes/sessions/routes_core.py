@@ -1,19 +1,20 @@
-"""Core session routes: create, list, get, update, fork, switch-agent."""
+"""Core session routes: create, list, get, update, fork."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
+from itertools import batched
 from typing import Any
 
 import httpx
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     HTTPException,
     Query,
@@ -30,20 +31,33 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id
-from omnigent.debug_logging import add_audit_attrs, debug_event
+from omnigent.db.utils import generate_agent_id, generate_conversation_id, generate_file_id
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_user_id,
+)
 from omnigent.entities import (
+    Agent,
     CommentsFingerprint,
     Conversation,
+    StoredFile,
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
+)
 from omnigent.models.model_override import validate_model_override
+from omnigent.native._native_supersession import supersession_notice_text
 from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -51,6 +65,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -65,20 +80,24 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
 )
-from omnigent.server.bundles import validate_agent_bundle
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
+from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.feature_flags import Feature
+from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
+)
+from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -90,7 +109,12 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._content_type import (
+    require_json_content_type,
     require_json_or_multipart_content_type,
+)
+from omnigent.server.routes._errors import (
+    STALE_CURSOR_RESPONSE,
+    agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
@@ -105,8 +129,9 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _EXTERNAL_CONVERSATION_ITEM_TYPE,
     _logger,
-    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -115,16 +140,25 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
+    _agent_forks_opencode_native_session,
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _create_session_worktree,
+    _delete_stored_session_bundle_after_failure,
     _discovery_key,
+    _enforce_filesystem_attachment_policy,
+    _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
-    _invalidate_runner_backed_snapshot_state,
+    _grant_default_public,
+    _is_codex_native_subagent,
+    _live_settings_change,
+    _LiveSettingsChange,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
     _permission_level_from_grants,
@@ -135,18 +169,23 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_collaboration_mode,
     _publish_permission_mode,
     _publish_sandbox_status,
+    _publish_session_superseded,
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_session_worktree_best_effort,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
-    _reset_runner_resources_after_switch,
+    _resolve_harness,
+    _runner_supports_side_chat_settings,
+    _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
     _session_status_from_cache,
     _set_read_state,
+    _start_managed_launch_task,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -158,17 +197,27 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
+    _cancel_pending_archive_stop,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
+    _ensure_native_terminal_ready,
     _ensure_runner_relay_ready,
+    _ensure_runner_session_initialized,
     _get_session_snapshot,
     _is_native_terminal_session,
     _labels_for_viewer,
+    _mark_session_moving,
+    _persist_external_conversation_item,
     _persist_model_change_note,
     _publish_runner_recovered_status,
     _run_managed_launch,
+    _session_is_moving,
+    _session_is_starting,
     _spawn_archive_stop,
+    _validate_session_model_selection,
+    ensure_runner_connected,
 )
+from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -178,17 +227,19 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
-    SessionAgentChangedEvent,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
     SessionProjectSummary,
+    SessionPullRequestSummary,
     SessionResponse,
-    SessionSwitchAgentRequest,
+    SupersessionReason,
     UpdateSessionRequest,
 )
+from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
@@ -199,6 +250,8 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -206,6 +259,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -218,6 +272,168 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+# Continues a claude-sdk session in a fresh session on ``/clear`` once the
+# release callback has freed its client; returns the new session's id.
+ClearSessionIntoFreshSession = Callable[
+    [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
+]
+_SESSION_LIST_BATCH_SIZE = 1000
+
+
+def _require_attachment_compatible_history(
+    session_id: str,
+    target_agent: Agent,
+    conversation_store: ConversationStore,
+    file_store: FileStore | None,
+    *,
+    up_to_response_id: str | None = None,
+) -> str | None:
+    """Reject a target that cannot replay files in the retained transcript.
+
+    :param session_id: Source session whose history will be retained.
+    :param target_agent: Agent selected for the fork or in-place switch.
+    :param conversation_store: Store containing the ordered source history.
+    :param file_store: Store containing authoritative attachment filenames.
+    :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :returns: A retained filesystem attachment's name, or ``None``.
+    :raises OmnigentError: If the target cannot open a referenced attachment.
+    """
+    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
+
+    filename = _filesystem_attachment_in_history(
+        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+    )
+    if filename is not None:
+        native = _native_coding_agent_for_agent(target_agent)
+        if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
+            raise OmnigentError(
+                f"This history includes '{filename}', which requires "
+                "Claude Code or Codex. Choose one of those harnesses, "
+                "or fork from before the attachment was sent.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    return filename
+
+
+async def _wake_runner_for_model_change(
+    request: Request,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+) -> Conversation:
+    """Restore a sleeping native session before applying an explicit model pick."""
+    if await _get_runner_client(conv.id, runner_router) is not None:
+        return conv
+    runner_client, conv = await ensure_runner_connected(
+        session_id=conv.id,
+        conv=conv,
+        app_state=request.app.state,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        raise_host_refusal=True,
+    )
+    if runner_client is None:
+        raise OmnigentError(
+            "Cannot switch models while the session host is offline. Reconnect the host and retry.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    terminal_ready = await _ensure_runner_session_initialized(
+        conv.id,
+        conv,
+        runner_client,
+        conversation_store,
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=True,
+        require_success=True,
+    )
+    if not terminal_ready:
+        outcome = await _ensure_native_terminal_ready(
+            runner_client,
+            conv.id,
+            conv,
+            persist_resource_event=False,
+            runner_router=runner_router,
+        )
+        if outcome.error is not None:
+            raise OmnigentError(outcome.error.message, code=ErrorCode.RUNNER_UNAVAILABLE)
+    await _ensure_runner_relay_ready(
+        conv.id, conv.runner_id, runner_client, conversation_store, conversation=conv
+    )
+    return conv
+
+
+_CODEX_SETTINGS_RESTORED_MESSAGE = (
+    "The terminal did not apply the model and reasoning effort changes. "
+    "The previous selections have been restored."
+)
+
+
+def _runner_reply_field(body: str, key: str) -> object:
+    """Return *key* from a runner's JSON reply, or ``None`` when it has none."""
+    try:
+        result = json.loads(body)
+    except ValueError:
+        return None
+    return result.get(key) if isinstance(result, dict) else None
+
+
+async def _restore_refused_settings(
+    conversation_store: ConversationStore,
+    session_id: str,
+    *,
+    previous: Conversation,
+    attempted: Conversation,
+    restore_model: bool,
+    live_change: _LiveSettingsChange | None,
+    began: int,
+    saved: int,
+    restore_effort: bool = True,
+) -> None:
+    """Undo a refused live change, keeping newer writes and restoring what it replaced."""
+    from omnigent.server.routes.sessions.routes_events import (
+        _raise_if_runner_re_tunnelled_to_another_replica,
+    )
+
+    # A runner that re-tunnelled is ordered by its new replica, which may have applied
+    # a newer selection; re-address the request there instead of undoing it here.
+    await _raise_if_runner_re_tunnelled_to_another_replica(
+        session_id, attempted.runner_id, conversation_store
+    )
+    restore = {"reasoning_effort": restore_effort, "model_override": restore_model}
+    replaced = {
+        "reasoning_effort": previous.reasoning_effort,
+        "model_override": previous.model_override,
+    }
+    if live_change is not None:
+        for key, wanted in restore.items():
+            if wanted:
+                restore[key], replaced[key] = live_change.restore_target(
+                    key, replaced[key], began=began, saved=saved
+                )
+    await asyncio.to_thread(
+        conversation_store.restore_session_settings_if_matches,
+        session_id,
+        previous=dataclasses.replace(previous, **replaced),
+        attempted=attempted,
+        restore_effort=restore["reasoning_effort"],
+        restore_model=restore["model_override"],
+    )
+
+
+def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
+    """Return whether Codex timed out before confirming a settings update it may still apply."""
+    return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
+
+
+def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None:
+    """Return the runner's reason when the terminal has no way to select the requested model."""
+    if result is None or _runner_reply_field(result.body, "error") != (
+        "claude_native_model_unsupported"
+    ):
+        return None
+    detail = _runner_reply_field(result.body, "detail")
+    return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
 
 
 def register_core_routes(
@@ -238,8 +454,190 @@ def register_core_routes(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
-) -> None:
-    """Register the core session routes on router."""
+    pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+) -> ClearSessionIntoFreshSession:
+    """Register the core session routes on router.
+
+    :returns: The claude-sdk ``/clear`` rotation the events route calls.
+    """
+
+    async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
+        """Refuse a malformed first input before the session exists."""
+        from starlette.datastructures import UploadFile as FormUploadFile
+
+        form = (
+            await request.form()
+            if request.headers.get("content-type", "").startswith("multipart/form-data")
+            else None
+        )
+        files = form.getlist("initial_files") if form is not None else []
+        if event is None:
+            if files:
+                raise OmnigentError(
+                    "initial_files requires initial_input", code=ErrorCode.INVALID_INPUT
+                )
+            return
+        if getattr(request.app.state, "startup_inputs", None) is None:
+            raise OmnigentError(
+                "durable initial input is not configured", code=ErrorCode.INVALID_INPUT
+            )
+        if files and (
+            file_store is None or not all(isinstance(file, FormUploadFile) for file in files)
+        ):
+            raise OmnigentError(
+                "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
+            )
+
+    async def _accept_initial_input(
+        request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
+    ) -> None:
+        """Save a checked first input, deleting the new session if that fails."""
+        if event is None:
+            return
+        startup = request.app.state.startup_inputs
+        try:
+            form = (
+                await request.form()
+                if request.headers.get("content-type", "").startswith("multipart/form-data")
+                else None
+            )
+            blocks = []
+            for file in form.getlist("initial_files") if form is not None else []:
+                assert file_store is not None  # _check_initial_input refused files without one
+                resource = await request.app.state.initial_file_upload(request, session_id, file)
+                stored = await asyncio.to_thread(
+                    file_store.get, resource["id"], session_id=session_id
+                )
+                assert stored is not None
+                blocks.append(
+                    {
+                        "type": "input_image"
+                        if (stored.content_type or "").startswith("image/")
+                        else "input_file",
+                        "file_id": stored.id,
+                        "filename": stored.filename,
+                    }
+                )
+            if blocks:
+                event = event.model_copy(
+                    update={
+                        "data": {
+                            **event.data,
+                            "content": [*blocks, *event.data.get("content", [])],
+                        }
+                    }
+                )
+            await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+        except Exception:
+            # The create fails, so leave no session (or uploaded file) for a retry
+            # to duplicate.
+            await _delete_unreturned_session(session_id)
+            raise
+
+    async def _list_session_grants(session_id: str) -> dict[str, int]:
+        """Every grant on *session_id*, as grantee to level."""
+        assert permission_store is not None
+        levels: dict[str, int] = {}
+        after: str | None = None
+        while True:
+            grants, after = await asyncio.to_thread(
+                permission_store.list_for_session, session_id, limit=500, after_user_id=after
+            )
+            levels.update((grant.user_id, grant.level) for grant in grants)
+            if after is None:
+                return levels
+
+    async def _copy_session_grants(source_id: str, target_id: str) -> None:
+        """Give *target_id*, a session created with no grants, exactly *source_id*'s."""
+        if permission_store is None:
+            return
+        for user_id, level in (await _list_session_grants(source_id)).items():
+            await asyncio.to_thread(permission_store.grant, user_id, target_id, level)
+
+    async def _release_unreturned_runner_session(session_id: str, routing: Conversation) -> None:
+        """Best-effort: drop a deleted fork's session from the runner it was sent to.
+
+        *routing* names that runner, since the fork's own binding may already
+        be rolled back. The runner's delete is idempotent and also stops an
+        initialization still in flight there.
+        """
+        try:
+            runner_client = await _get_runner_client(
+                session_id, runner_router, conversation=routing
+            )
+            if runner_client is not None:
+                await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
+        except Exception:
+            _logger.warning(
+                "Failed to release the runner session of unreturned fork %s",
+                session_id,
+                exc_info=True,
+            )
+
+    async def _release_unreturned_fork_host(request: Request, host_id: str | None) -> None:
+        """Tear down a deleted fork's managed sandbox if nothing else uses it.
+
+        A fork may have been the sandbox's last reference (its source deleted
+        meanwhile), so its removal ends the sandbox like a session delete.
+        Best-effort: the original error is what the caller reports.
+        """
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_id is None or host_store is None:
+            return
+        from omnigent.server.managed_hosts import release_session_managed_host
+
+        try:
+            await release_session_managed_host(
+                host_id, host_store, getattr(request.app.state, "sandbox_config", None)
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to release the managed host %s of an unreturned fork",
+                host_id,
+                exc_info=True,
+            )
+
+    async def _delete_unreturned_session(session_id: str) -> None:
+        """Delete a session whose creating request failed, with its unshared files."""
+        if file_store is not None:
+            blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+            if artifact_store is not None:
+                for blob_key in blob_keys:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(artifact_store.delete, blob_key)
+        await conversation_store.delete_conversation(session_id)
+
+    async def _unreturned_fork_agent_copy(
+        fork_id: str, source_agent_id: str | None
+    ) -> Agent | None:
+        """The agent copy a failed fork was given in place of its source's agent."""
+        try:
+            fork = await asyncio.to_thread(conversation_store.get_conversation, fork_id)
+            if fork is None or fork.agent_id is None or fork.agent_id == source_agent_id:
+                return None
+            return await asyncio.to_thread(agent_store.get, fork.agent_id)
+        except Exception:
+            _logger.exception("Failed to look up rejected fork's agent copy")
+            return None
+
+    async def _delete_unreturned_agent_copy(
+        session_id: str, agent_id: str, bundle_location: str | None
+    ) -> None:
+        """Remove the agent copy a failed fork made, once its session is gone."""
+        try:
+            # Keep the copy if session rollback failed and still references it.
+            if (
+                await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                is not None
+            ):
+                return
+            await asyncio.to_thread(agent_store.delete, agent_id)
+            if bundle_location is not None and artifact_store is not None:
+                await asyncio.to_thread(
+                    _delete_stored_session_bundle_after_failure, artifact_store, bundle_location
+                )
+        except Exception:
+            _logger.exception("Failed to remove rejected fork's agent copy")
 
     async def _schedule_managed_launch(
         request: Request,
@@ -249,6 +647,7 @@ def register_core_routes(
         user_id: str | None,
         sandbox_provider: str | None,
         workspaces: list[str],
+        requested_host_id: str | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -282,6 +681,9 @@ def register_core_routes(
             parallel; empty for an empty sandbox. One repo becomes the
             session's working directory; several are cloned as siblings
             and the working directory is the parent that holds them.
+        :param requested_host_id: Host id the caller chose for the sandbox
+            host (already checked against existing hosts),
+            or ``None`` to let the launch mint one.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -296,9 +698,16 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
+            REQUESTED_HOST_ID_LABEL_KEY,
             managed_repo_labels,
             parse_repo_workspace,
         )
+
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            profile = await asyncio.to_thread(profile_catalog.get_session_snapshot, session_id)
+            if profile is not None:
+                sandbox_provider = profile["provider"]
 
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
@@ -325,43 +734,96 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        managed_labels: dict[str, str] = {}
+        if requested_host_id is not None:
+            managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
         if workspaces:
             # The session row's workspace is overwritten with the CLONED path at
             # bind time; record the raw request value(s) so a sandbox relaunch
             # can re-clone the same repositories. Stored one label per repo (not
             # a single joined value) so the 256-char label-value cap can't
             # silently truncate the list and drop repos on relaunch.
+            managed_labels.update(managed_repo_labels(workspaces))
+        if managed_labels:
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                managed_repo_labels(workspaces),
+                managed_labels,
+            )
+        if getattr(request.app.state, "startup_inputs", None) is not None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the
-        # "provisioning" stage.
-        _publish_sandbox_status(session_id, "provisioning")
-        launch_task = asyncio.create_task(
-            _run_managed_launch(
-                session_id=session_id,
-                # On auth-disabled servers user_id is None; the sandbox
-                # host registers under the reserved local owner.
-                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                sandbox_config=sandbox_config,
-                repos=repos,
-                tracker=managed_launches,
-                conversation_store=conversation_store,
-                host_store=host_store_for_managed,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                provider=sandbox_provider,
-                agent_store=agent_store,
-                agent_id=agent_id,
-            )
+        # "provisioning" stage and the provider being launched.
+        _publish_sandbox_status(
+            session_id,
+            "provisioning",
+            provider=sandbox_provider or sandbox_config.default.provider,
         )
-        _managed_launch_tasks.add(launch_task)
-        launch_task.add_done_callback(_managed_launch_tasks.discard)
+        launch = _run_managed_launch(
+            session_id=session_id,
+            # On auth-disabled servers user_id is None; the sandbox
+            # host registers under the reserved local owner.
+            owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=managed_launches,
+            conversation_store=conversation_store,
+            host_store=host_store_for_managed,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            provider=sandbox_provider,
+            agent_store=agent_store,
+            agent_id=agent_id,
+            host_id=requested_host_id,
+            sandbox_profiles=profile_catalog,
+        )
+        _start_managed_launch_task(
+            session_id,
+            launch,
+            conversation_store=conversation_store,
+            tracker=managed_launches,
+            startup=getattr(request.app.state, "startup_inputs", None),
+        )
+
+    async def _check_requested_host_id(
+        request: Request, requested_host_id: str, user_id: str | None
+    ) -> None:
+        """
+        Reject a caller-chosen managed host id the launch could not register.
+
+        Not an idempotency key: the host row is written by the background
+        launch, so a retry could not find the session it would replay.
+
+        :param request: The originating request (for ``app.state`` lookups).
+        :param requested_host_id: The create's ``requested_host_id``.
+        :param user_id: The caller, who will own the host.
+        :raises OmnigentError: ``ALREADY_EXISTS`` if a host already has the id,
+            or one of the caller's hosts already has its derived name.
+        """
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.managed_hosts import managed_host_name
+
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_store is None:
+            return
+        name = managed_host_name(requested_host_id)
+        if await asyncio.to_thread(
+            host_store.host_identity_taken,
+            host_id=requested_host_id,
+            user_id=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            name=name,
+        ):
+            raise OmnigentError(
+                f"host {requested_host_id} or its name {name} is already in use",
+                code=ErrorCode.ALREADY_EXISTS,
+            )
 
     async def _bind_and_launch_on_caller_host(
         request: Request,
@@ -371,6 +833,7 @@ def register_core_routes(
         host_id: str,
         workspace: str | None,
         harness: str | None,
+        conversation: Conversation | None = None,
     ) -> tuple[str, bool] | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
@@ -404,6 +867,9 @@ def register_core_routes(
             requires it with ``host_id``) and raises.
         :param harness: Canonical harness for the host-side
             configuration check, or ``None`` to skip it.
+        :param conversation: Optional authoritative row already returned by
+            session creation, used to avoid re-reading it during launch
+            authorization. Its id must match ``session_id``.
         :returns: ``(runner_id, launch_failed)`` after the bind, or
             ``None`` when the server has no host registry/store wired
             (minimal test wirings — nothing was attempted).
@@ -420,19 +886,27 @@ def register_core_routes(
             encode_host_frame,
         )
         from omnigent.runner.identity import token_bound_runner_id
-        from omnigent.server.routes._host_launch import resolve_host_launch
-
-        target = await asyncio.to_thread(
+        from omnigent.server.routes._host_launch import (
+            LAUNCH_TIMEOUT_ENV_VAR,
             resolve_host_launch,
-            user_id=user_id,
-            host_id=host_id,
-            session_id=session_id,
-            host_store=host_store_inst,
-            host_registry=host_registry,
-            conversation_store=conversation_store,
-            permission_store=permission_store,
+            resolve_launch_timeout_s,
         )
+
+        with creation_stage("create_acl_ms"):
+            target = await asyncio.to_thread(
+                resolve_host_launch,
+                user_id=user_id,
+                host_id=host_id,
+                session_id=session_id,
+                host_store=host_store_inst,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                conversation=conversation,
+                sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
+            )
         conn = target.conn
+        await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -446,8 +920,32 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            try:
+                await asyncio.to_thread(profile_catalog.require_session_host, session_id, host_id)
+            except Exception:
+                with contextlib.suppress(ValueError):
+                    await asyncio.to_thread(
+                        conversation_store.clear_runner_id,
+                        session_id,
+                        expected_binding=dataclasses.replace(target.conv, runner_id=runner_id),
+                    )
+                raise
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=session_id,
+                runner_id=runner_id,
+                operation="create",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
-        future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
         if workspace is None:  # pragma: no cover — schema guards
             raise OmnigentError(
@@ -465,15 +963,30 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
+        launch_timeout_s = resolve_launch_timeout_s()
+        launch_result: HostLaunchResult
         try:
             host_registry.send_text(conn, launch_frame)
-            launch_result = await asyncio.wait_for(future, timeout=30.0)
+            launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
-        except asyncio.TimeoutError:
-            launch_result = {"status": "failed", "error": "host launch timed out"}
+        except TimeoutError:
+            launch_result = {
+                "status": "failed",
+                "error": (
+                    f"host launch timed out after {launch_timeout_s:g}s "
+                    f"(raise {LAUNCH_TIMEOUT_ENV_VAR} if this launch needs longer)"
+                ),
+            }
         finally:
             conn.pending_launches.pop(request_id, None)
             if not future.done():
@@ -492,12 +1005,49 @@ def register_core_routes(
                 extra=debug_event(
                     "runner_launch_failed",
                     session_id=session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                    error_code=launch_result.get("error_code") or "host_launch_failed",
                     error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
         return runner_id, launch_failed
+
+    async def side_chat_allowed(
+        user_id: str | None, session_id: str, conversation: Conversation | None = None
+    ) -> bool:
+        """Whether *user_id* may start side chats in a session: its root's owner only."""
+        if auth_provider is None or permission_store is None:
+            return True
+        conv = conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        return conv is not None and await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
+    @router.post(
+        "/sessions/orchestrated",
+        status_code=201,
+        response_model=None,
+        include_in_schema=False,
+        dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+    )
+    async def create_orchestrated_session(
+        request: Request,
+    ) -> SessionResponse | CreatedSessionResponse:
+        """Use a distinct route so unsupported servers reject before creation."""
+        if not request.headers.get(ORCHESTRATION_SOURCE_HEADER):
+            raise OmnigentError(
+                "Independent sessions require an orchestration source", code=ErrorCode.FORBIDDEN
+            )
+        return await create_session(request)
 
     @router.post(
         "/sessions",
@@ -539,7 +1089,15 @@ def register_core_routes(
         """
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-        if content_type == "multipart/form-data":
+        if (
+            content_type == "multipart/form-data"
+            and ORCHESTRATION_SOURCE_HEADER in request.headers
+        ):
+            raise OmnigentError(
+                "Independent sessions require agent_id", code=ErrorCode.INVALID_INPUT
+            )
+        form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
+        if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
@@ -547,8 +1105,14 @@ def register_core_routes(
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             return result
 
+        if form is not None and not isinstance(form.get("metadata"), str):
+            raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         try:
-            payload = await request.json()
+            payload = (
+                json.loads(str(form.get("metadata", "{}")))
+                if form is not None
+                else await request.json()
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -578,7 +1142,119 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
-        resp = await _create_session_from_existing_agent(
+        orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        source = None
+        if orchestration_source is not None:
+            source = await asyncio.to_thread(
+                require_orchestration_source,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            if body.parent_session_id is not None:
+                raise OmnigentError(
+                    "Orchestration creates independent sessions", code=ErrorCode.INVALID_INPUT
+                )
+            if body.host_type == "managed":
+                deployment = getattr(request.app.state, "sandbox_config", None)
+                if deployment is None or not deployment.managed_launch_supported:
+                    raise OmnigentError(
+                        "Managed sandboxes are unavailable; configure a sandbox provider "
+                        "or use placement='same_host'",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+
+        # Checked before the session exists so a rejected create leaves nothing
+        # behind.
+        await _check_initial_input(request, body.initial_input)
+        if body.requested_host_id is not None:
+            await _check_requested_host_id(request, body.requested_host_id, user_id)
+        if orchestration_source is not None:
+            # Recheck source permissions and placement after asynchronous validation.
+            source = await asyncio.to_thread(
+                require_orchestration_source,
+                request,
+                user_id,
+                conversation_store,
+                permission_store,
+            )
+            if body.initial_items:
+                raise OmnigentError(
+                    "Use initial_input for the first task", code=ErrorCode.INVALID_INPUT
+                )
+            if body.initial_input is not None:
+                from omnigent.server.session_orchestration import orchestration_message
+
+                first = body.initial_input
+                content = first.data.get("content")
+                if (
+                    first.type != "message"
+                    or first.data.get("role") != "user"
+                    or not isinstance(content, list)
+                    or len(content) != 1
+                    or not isinstance(content[0], dict)
+                    or content[0].get("type") != "input_text"
+                ):
+                    raise OmnigentError(
+                        "The first task must be text", code=ErrorCode.INVALID_INPUT
+                    )
+                body.initial_input = orchestration_message(source.id, content[0].get("text"))
+            if body.host_type == "external":
+                placement = await asyncio.to_thread(
+                    routing_host_session, source, conversation_store
+                )
+                if placement is None or not placement.host_id or not placement.workspace:
+                    raise OmnigentError(
+                        "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
+                    )
+                try:
+                    body = type(body).model_validate(
+                        {
+                            **body.model_dump(exclude_unset=True),
+                            "host_id": placement.host_id,
+                            "workspace": placement.workspace,
+                        }
+                    )
+                except ValidationError as exc:
+                    raise OmnigentError(
+                        "Sender host/workspace is invalid for independent creation",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+        if source is not None and request.app.state.feature_flags.enabled(
+            Feature.SIBLING_SESSIONS
+        ):
+            body.sibling_source_id = source.root_conversation_id
+        if body.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                body.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=body.parent_session_id,
+                host_id=body.host_id,
+                host_type=body.host_type,
+            )
+            if body.initial_items:
+                raise OmnigentError(
+                    "Siblings start a fresh conversation", code=ErrorCode.INVALID_INPUT
+                )
+            if (
+                "project_id" in body.model_fields_set
+                and body.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            body.sibling_source_id = sibling_source.id
+            body.project_id = sibling_source.project_id
+        creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+        resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -592,12 +1268,13 @@ def register_core_routes(
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
+            created_by_session_id=source.id if source is not None else None,
+            created_by_project_id=source.project_id if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
         # until the first forwarded event.
-        conv = conversation_store.get_conversation(resp.id)
         # Mark the terminal spin-up flag at creation — the earliest
         # possible point — for a host-launched terminal-first session
         # (claude-native / codex-native). The runner's own pending emit
@@ -617,14 +1294,19 @@ def register_core_routes(
         )
         if _terminal_first_create:
             _publish_terminal_pending(resp.id, True)
-        _rc = await _get_runner_client(resp.id, runner_router)
+        _rc = await _get_runner_client(
+            resp.id,
+            runner_router,
+            conversation=conv,
+        )
         if _rc is not None and conv is not None:
             # Send the full session-init envelope (not the legacy id-only body)
             # so the runner seeds the first spawn from current session state —
-            # notably the persisted /model override — rather than relying on a
-            # best-effort reverse GET whose failure would silently reintroduce
-            # the first-turn respawn. Older runners ignore the extra
-            # ``session_init`` key and still read the top-level id fields.
+            # notably the persisted /model override and a cross-harness
+            # harness_override — rather than relying on a best-effort reverse
+            # GET whose failure would silently reintroduce the first-turn
+            # respawn. Older runners ignore the extra ``session_init`` key and
+            # still read the top-level id fields.
             # A session not yet bound to an agent keeps the id-only body: the
             # envelope builder requires an agent_id.
             init_body: dict[str, Any] = {
@@ -634,7 +1316,14 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    # ``initial_items`` are already persisted and forwarded by
+                    # now, so suppress the runner's recovery turn or they run
+                    # twice.
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        suppress_recovery_turn=True,
+                    )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently
@@ -659,13 +1348,17 @@ def register_core_routes(
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
         # sees the grant.
         if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(permission_store.grant, user_id, resp.id, LEVEL_OWNER)
-            resp.permission_level = await _get_permission_level(user_id, resp.id, permission_store)
-        # Push the new session to this user's other open tabs (see the
-        # multipart path above for the rationale).
-        _announce_session_added(user_id, resp.id)
-
+            with creation_stage("create_identity_ms"):
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+            with creation_stage("create_acl_ms"):
+                grant = await asyncio.to_thread(
+                    permission_store.grant,
+                    user_id,
+                    resp.id,
+                    LEVEL_OWNER,
+                )
+            resp.permission_level = grant.level
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -676,32 +1369,43 @@ def register_core_routes(
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
         launch_host_id = body.host_id
-        if body.host_type == "managed" and resp.runner_id is None:
-            await _schedule_managed_launch(
-                request,
-                session_id=resp.id,
-                agent_id=conv.agent_id if conv is not None else None,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=body.managed_repo_workspaces(),
-            )
+        try:
+            if body.host_type == "managed" and resp.runner_id is None:
+                await _schedule_managed_launch(
+                    request,
+                    session_id=resp.id,
+                    agent_id=conv.agent_id if conv is not None else None,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=body.managed_repo_workspaces(),
+                    requested_host_id=body.requested_host_id,
+                )
+        finally:
+            # Push the new session to this user's other open tabs (see the
+            # multipart path above for the rationale) once its managed labels
+            # are written, so a tab that lists it on this push sees the row the
+            # create returns. Still pushed when the managed guard fails: the
+            # owned row stays visible either way (see the grant above).
+            _announce_session_added(user_id, resp.id)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
-            launched = await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=resp.id,
-                host_id=launch_host_id,
-                # Already written by _create_session_from_existing_agent;
-                # only runner_id still needs the atomic set inside.
-                workspace=resp.workspace,
-                # Already canonical (see _resolve_harness).
-                harness=resp.harness,
-            )
+            with creation_stage("create_host_launch_ms"):
+                launched = await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=resp.id,
+                    host_id=launch_host_id,
+                    # Already written by _create_session_from_existing_agent;
+                    # only runner_id still needs the atomic set inside.
+                    workspace=resp.workspace,
+                    # Already canonical (see _resolve_harness).
+                    harness=resp.harness,
+                    conversation=conv,
+                )
             if launched is not None:
                 runner_id, launch_failed = launched
                 if launch_failed and _terminal_first_create:
@@ -713,6 +1417,30 @@ def register_core_routes(
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
 
+        # Default-public grant only once every launch step has been accepted, so a
+        # rejected request never leaves a public session behind. Sub-agent
+        # children follow their parent's grants instead.
+        if (
+            user_id is not None
+            and body.parent_session_id is None
+            and orchestration_source is None
+            and body.sibling_source_id is None
+        ):
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                resp.id,
+                managed=body.host_type == "managed",
+                workspace=conv.workspace if conv is not None else None,
+                host_id=launch_host_id,
+            )
+        if body.sibling_source_id is not None and conv is not None:
+            from omnigent.server.session_families import project_families
+
+            _, families = await asyncio.to_thread(
+                project_families, conversation_store, permission_store, [conv], user_id
+            )
+            resp.family = families.get(conv.id)
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
 
@@ -756,22 +1484,62 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        if parsed_metadata.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                parsed_metadata.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=parsed_metadata.parent_session_id,
+                host_id=parsed_metadata.host_id,
+                host_type=parsed_metadata.host_type,
+            )
+            if (
+                "project_id" in parsed_metadata.model_fields_set
+                and parsed_metadata.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            parsed_metadata.sibling_source_id = sibling_source.id
+            parsed_metadata.project_id = sibling_source.project_id
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
         )
 
+        if (
+            parsed_metadata.sibling_source_id is None
+            and "git" not in parsed_metadata.model_fields_set
+        ):
+            # Ordinary uploads choose worktrees in their separate runner launch.
+            parsed_metadata = parsed_metadata.model_copy(update={"git": None})
         project_resolution = await resolve_project_session_create(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        await _check_initial_input(request, parsed_metadata.initial_input)
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
         inherited_runner_id: str | None = None
+        parent_conv = None
         if parsed_metadata.parent_session_id is not None:
-            inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
+            parent_conv, inherited_runner_id = await _authorize_bundled_parent_and_inherit_runner(
                 parsed_metadata.parent_session_id,
                 user_id=user_id,
                 permission_store=permission_store,
@@ -779,7 +1547,29 @@ def register_core_routes(
                 runner_router=runner_router,
             )
 
+        sandbox_profile = await prepare_profile(
+            request,
+            parsed_metadata,
+            user_id=user_id,
+            inherited_session_id=parsed_metadata.parent_session_id,
+        )
+        if sandbox_profile is not None and parsed_metadata.host_type == "managed":
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"sandbox_provider": sandbox_profile["provider"]}
+            )
+
         bundle_bytes = await bundle.read()
+        parsed_metadata = parsed_metadata.model_copy(
+            update={
+                "labels": {
+                    **parsed_metadata.labels,
+                    CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
+                        request.headers,
+                        parent_labels=parent_conv.labels if parent_conv is not None else None,
+                    ),
+                }
+            }
+        )
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
         # validation, and _create_session_from_bundle reuses the parsed
@@ -787,8 +1577,21 @@ def register_core_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
+
+        if parsed_metadata.mcp_registry_services:
+            from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
+            from omnigent.server.routes.session_mcp_servers import _require_registry_service
+
+            for service_id in parsed_metadata.mcp_registry_services:
+                _require_registry_service(request, service_id, user_id)
+            labels = {
+                **parsed_metadata.labels,
+                **registry_selection_labels(spec, parsed_metadata.mcp_registry_services),
+            }
+            parsed_metadata = parsed_metadata.model_copy(update={"labels": labels})
+            spec = selected_mcp_spec(spec, labels)
 
         # Caller-supplied external host: validate the workspace against
         # the uploaded spec's os_env boundary BEFORE creating the row
@@ -810,14 +1613,135 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
-        result = await asyncio.to_thread(
-            _create_session_from_bundle,
-            conversation_store,
-            artifact_store,
+        from omnigent.server.mcp_compatibility import (
+            registry_services,
+            require_registry_mcp_runtime,
+        )
+
+        require_registry_mcp_runtime(
+            registry_services(spec),
+            host_id=parsed_metadata.host_id,
+            runner_id=inherited_runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        )
+
+        from omnigent.server.routes.sandbox_inference import prepare_create_inference
+
+        inference_snapshot, inference_model = await prepare_create_inference(
+            request,
             parsed_metadata,
-            bundle_bytes,
-            inherited_runner_id,
             spec,
+            user_id,
+            conversation_store,
+            model_override=parsed_metadata.model_override,
+        )
+        from omnigent.models.model_catalog import spec_harness
+        from omnigent.server.routes._session_harness_readiness import (
+            require_codex_plan_launch_support,
+            validate_create_harness_readiness,
+        )
+
+        await validate_create_harness_readiness(
+            harness=spec_harness(spec),
+            host_id=parsed_metadata.host_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+            inherited_runner_id=inherited_runner_id,
+            user_id=user_id,
+            conversation_store=conversation_store,
+            host_store=getattr(request.app.state, "host_store", None),
+            parent=parent_conv,
+        )
+        require_codex_plan_launch_support(
+            harness=spec_harness(spec),
+            host_id=parsed_metadata.host_id,
+            labels=parsed_metadata.labels,
+            host_registry=getattr(request.app.state, "host_registry", None),
+        )
+        git_options = parsed_metadata.git
+        git_branch: str | None = None
+        created_worktree_path: str | None = None
+        if git_options is not None:
+            if git_options.existing_worktree:
+                from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+
+                try:
+                    validate_branch_name(git_options.branch_name)
+                except WorktreeError as exc:
+                    raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+                git_branch = git_options.branch_name
+            else:
+                created_worktree = await _create_session_worktree(
+                    host_id=parsed_metadata.host_id,
+                    source_repo=parsed_metadata.workspace,
+                    git=git_options,
+                    request=request,
+                )
+                created_worktree_path = created_worktree.worktree_path
+                git_branch = created_worktree.branch
+                from omnigent.server.routes._host_worktree import (
+                    WORKTREE_ROOT_LABEL_KEY,
+                    worktree_root_fingerprint,
+                )
+
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "workspace": created_worktree.workspace or created_worktree.worktree_path,
+                        "labels": {
+                            **parsed_metadata.labels,
+                            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(
+                                created_worktree.worktree_path
+                            ),
+                        },
+                    }
+                )
+        try:
+            with creation_stage("create_persistence_ms"):
+                result = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    parsed_metadata,
+                    bundle_bytes,
+                    inherited_runner_id,
+                    spec,
+                    inference_snapshot,
+                    inference_model,
+                    git_branch=git_branch,
+                    created_by=user_id,
+                    agent_store=agent_store,
+                )
+            if parsed_metadata.sibling_source_id is not None:
+                from omnigent.server.session_families import complete_sibling_creation
+
+                await complete_sibling_creation(
+                    conversation_store,
+                    parsed_metadata.sibling_source_id,
+                    result.session_id,
+                    user_id=user_id,
+                )
+            await record_profile(request, result.session_id, sandbox_profile, conversation_store)
+        except Exception:
+            if (
+                created_worktree_path is not None
+                and parsed_metadata.host_id is not None
+                and git_branch is not None
+            ):
+                await _remove_session_worktree_best_effort(
+                    host_id=parsed_metadata.host_id,
+                    worktree_path=created_worktree_path,
+                    branch=git_branch,
+                    delete_branch=git_options is None or not git_options.existing_branch,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    reason="create-rollback",
+                )
+            raise
+        session_created(
+            result.session_id,
+            inherited_runner_id,
+            parent_session_id=parsed_metadata.parent_session_id,
+            agent_id=result.agent_id,
+            harness=spec_harness(spec),
         )
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
@@ -826,6 +1750,7 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation_store=conversation_store,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
@@ -833,10 +1758,15 @@ def register_core_routes(
         # the just-persisted session unowned and thus invisible to the
         # caller. Push to the caller's other open tabs, too.
         if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(
-                permission_store.grant, user_id, result.session_id, LEVEL_OWNER
-            )
+            with creation_stage("create_identity_ms"):
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+            with creation_stage("create_acl_ms"):
+                await asyncio.to_thread(
+                    permission_store.grant, user_id, result.session_id, LEVEL_OWNER
+                )
+        await _accept_initial_input(
+            request, result.session_id, parsed_metadata.initial_input, user_id
+        )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
@@ -851,11 +1781,7 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
-                # Bundle metadata carries a single repo; multi-repo is a
-                # web-picker (JSON) feature. Empty list = no repo.
-                workspaces=[parsed_metadata.workspace]
-                if parsed_metadata.workspace is not None
-                else [],
+                workspaces=parsed_metadata.managed_repo_workspaces(),
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic
@@ -868,13 +1794,30 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=result.session_id,
-                host_id=parsed_metadata.host_id,
+            with creation_stage("create_host_launch_ms"):
+                await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=result.session_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                    harness=canonicalize_harness(raw_harness) or raw_harness,
+                )
+        # Default-public grant only after the launch steps were accepted (see the
+        # JSON path). Sub-agent children follow their parent's grants, whether or
+        # not they inherited its runner.
+        if (
+            user_id is not None
+            and parsed_metadata.parent_session_id is None
+            and parsed_metadata.sibling_source_id is None
+        ):
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                result.session_id,
+                managed=parsed_metadata.host_type == "managed",
                 workspace=parsed_metadata.workspace,
-                harness=canonicalize_harness(raw_harness) or raw_harness,
+                host_id=parsed_metadata.host_id,
             )
         return result
 
@@ -890,8 +1833,7 @@ def register_core_routes(
         request: Request,
     ) -> list[SessionProjectSummary]:
         """
-        Return the caller's projects as ``{"id", "name"}`` pairs, ordered
-        alphabetically by name.
+        Return the caller's project summaries in their preferred display order.
 
         Dual-reads both project representations and unions them by name:
         - **First-class projects** (``project_store``) — carry an ``id`` and
@@ -906,7 +1848,7 @@ def register_core_routes(
         their owned rows) — a project shared to them but owned by another user
         does not surface as one of their own folders.
 
-        :returns: List of :class:`SessionProjectSummary` ordered by name.
+        :returns: Project summaries in custom order, or alphabetical order by default.
         """
         user_id = _require_user(request, auth_provider)
 
@@ -922,9 +1864,17 @@ def register_core_routes(
                         icon=icon if isinstance(icon, str) else None,
                     )
             # Legacy path: label-derived projects (id=None unless already first-class).
-            for name in conversation_store.list_projects(owned_by=user_id):
+            for name in sorted(conversation_store.list_projects(owned_by=user_id)):
                 by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
-            return [by_name[name] for name in sorted(by_name)]
+            from omnigent.stores.project_store import apply_project_order
+
+            order = project_store.get_order(user_id=user_id) if project_store is not None else None
+            return apply_project_order(
+                list(by_name.values()),
+                order,
+                project_id=lambda p: p.id,
+                project_name=lambda p: p.name,
+            )
 
         return await asyncio.to_thread(_list_union)
 
@@ -983,7 +1933,9 @@ def register_core_routes(
         session_id: str,
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
+        include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1004,6 +1956,16 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_live_status: When ``False``, skip the live-status
+            probe of the session's bound runner on a status-cache miss
+            and report ``status`` from the cached or persisted value.
+            Runner-owned reads pass ``False`` because the probe targets
+            the very runner waiting on this response.
+        :param include_usage: When ``False``, skip the subtree usage read and
+            return null usage fields with ``usage_included=False``. Display
+            clients can independently request this route with
+            ``include_usage=true``, ``include_items=false``,
+            ``include_liveness=false``, and ``refresh_state=false``.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -1022,7 +1984,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1031,12 +1993,19 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_live_status=include_live_status,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
+            request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(
+            user_id, session_id, access.conversation
+        )
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -1081,10 +2050,36 @@ def register_core_routes(
 
     # ── GET /sessions ───────────────────────────────────────────
 
+    def _session_agent_metadata(
+        conversations: Sequence[Conversation],
+    ) -> tuple[dict[str, str], dict[str, str | None]]:
+        """Resolve list metadata off the event loop with one batched agent read."""
+        agents = agent_store.get_many(
+            list({conv.agent_id for conv in conversations if conv.agent_id is not None})
+        )
+        harnesses_by_id: dict[str, str | None] = {}
+        for conv in conversations:
+            try:
+                harnesses_by_id[conv.id] = _resolve_harness(
+                    conv, agent_cache=agent_cache, agents_by_id=agents
+                )
+            except Exception as error:
+                # Optional artifact metadata must not hide an otherwise readable session.
+                harnesses_by_id[conv.id] = None
+                _logger.warning(
+                    "Could not resolve list harness for session %s (%s)",
+                    conv.id,
+                    type(error).__name__,
+                )
+        return (
+            {agent.id: agent.name for agent in agents.values()},
+            harnesses_by_id,
+        )
+
     @router.get(
         "/sessions",
         response_model=None,
-        responses={200: {"model": SessionList}},
+        responses={200: {"model": SessionList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_sessions(
         request: Request,
@@ -1096,12 +2091,14 @@ def register_core_routes(
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
         search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
-    ) -> PaginatedList:
+    ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
 
@@ -1132,6 +2129,12 @@ def register_core_routes(
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
+        :param search_scope: Which ``search_query`` matches to return.
+            ``"all"`` (default) returns title or content matches.
+            ``"title"`` returns only title matches. ``"content"``
+            returns content matches whose title does not match;
+            ``title`` and ``content`` never overlap. Ignored without
+            a ``search_query``.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
@@ -1148,10 +2151,16 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param expand_families: Add owned family context to matching rows,
+            including members outside the agent, pin, and page filters.
+            Ownership and archive filters still apply; search disables expansion.
+            Pagination cursors refer to the original filtered page.
         :param visibility: Ownership/archive filter for the sidebar tabs.
             ``"mine"`` returns only sessions the caller owns (owner-level
             grant). ``"shared"`` returns only sessions accessible but not
-            owned. ``"archived"`` returns only archived sessions.
+            owned. ``"archived"`` returns only archived sessions; with
+            ``project``, only owned sessions are returned so first-class
+            project names resolve within the caller's projects.
             ``"all"`` (default) returns all accessible non-archived
             sessions, matching the legacy behaviour.
         :returns: A :class:`PaginatedList` of
@@ -1180,7 +2189,8 @@ def register_core_routes(
         #   like-named project stays out of the viewer's own folder.
         # mine/shared require an identity anchor (owned_by / accessible_by).
         # Passing None into the store's shared_only path raises ValueError.
-        # "archived" carries no ownership semantics — preserve it in no-auth.
+        # "archived" is owner-scoped with a project (name resolution needs owned_by);
+        # without a project it includes accessible archives. Preserve it in no-auth.
         effective_visibility = visibility
         if user_id is None and visibility in ("mine", "shared"):
             effective_visibility = "all"
@@ -1198,7 +2208,7 @@ def register_core_routes(
             archived_only_param = False
         elif effective_visibility == "archived":
             accessible_by_param = user_id
-            owned_by_param = None
+            owned_by_param = user_id if project else None
             shared_only_param = False
             # archived_only=True implies include_archived=True — the store
             # filters to archived=True regardless of include_archived.
@@ -1235,6 +2245,7 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
+            search_scope=search_scope,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
             project=project,
@@ -1242,123 +2253,135 @@ def register_core_routes(
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
         )
-        # list_conversations may return rows with agent_id=None for
-        # legacy conversations; skip them before building the batch IDs.
-        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
-        if not conv_ids:
-            return PaginatedList(
-                data=[],
-                first_id=page.first_id,
-                last_id=page.last_id,
-                has_more=page.has_more,
-            )
-        # Batch-fetch permissions and agent names concurrently.
-        # The tasks table has been removed — status comes exclusively from
-        # the relay-fed ``_session_status_cache``.
-        unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
-        perms_by_conv: dict[str, list[SessionPermission]]
-        if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-        else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            perms_by_conv = {}
-            user_is_admin = False
-        # In-memory lookup — no I/O, so batching avoids re-acquiring
-        # the index's lock per row but otherwise has no DB cost.
-        pending_counts = pending_elicitations.counts_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
-        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
-        # A session whose persisted live_status is still running/waiting but
-        # whose runner is confirmed gone — a replica that restarted and
-        # outlived its runner, a crashed host, a graceful disconnect
-        # mid-turn — would otherwise read "running" forever: no executor is
-        # left to emit the terminal edge that clears it. Settle that exact
-        # subset here so the sidebar (and every other reader) stops showing a
-        # turn that isn't happening. The list still does NOT compute liveness
-        # for the general case (see the note below the item build): the probe
-        # is bounded to a tiny suspect set so the common path pays nothing.
-        #
-        # Suspect = a row that (a) still says running/waiting, (b) has a bound
-        # runner, (c) has NO live entry in this replica's status cache — i.e.
-        # its "running" came from the cross-replica DB mirror, not a runner
-        # this replica is actively relaying — and (d) has a stale/absent
-        # runner_last_seen heartbeat. The freshness check reads the stamp
-        # already carried on the list row (no extra query): a runner up on
-        # another replica keeps it fresh, so such a session is filtered out
-        # here and never reaches the probe. Only stamp-stale candidates fall
-        # through to liveness_lookup, which additionally rules out a runner
-        # whose tunnel is live on THIS replica before we settle.
-        if liveness_lookup is not None:
-            orphan_suspects = [
-                conv
-                for conv in page.data
-                if conv.agent_id is not None
-                and conv.runner_id is not None
-                and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
-                and not runner_seen_is_fresh(conv.runner_last_seen)
-                and (
-                    permission_store is None
-                    or _permission_level_from_grants(
-                        user_id,
-                        perms_by_conv.get(conv.id, []),
-                        user_is_admin,
-                    )
-                    == LEVEL_OWNER
+        # Side chats surface only as Workspace-rail tabs, so drop any
+        # side-chat-labeled fork from the sidebar list (it is still a normal
+        # session, just not listed as a top-level one here).
+        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
+        boundary_row = page.data[-1] if page.data else None
+        page_boundary = (
+            {
+                "id": boundary_row.id,
+                "created_at": boundary_row.created_at,
+                "updated_at": boundary_row.updated_at,
+            }
+            if boundary_row
+            else None
+        )
+        from omnigent.server.session_families import project_families
+
+        page.data, family_info = await asyncio.to_thread(
+            project_families,
+            conversation_store,
+            permission_store,
+            page.data,
+            user_id,
+            expand=expand_families and not normalized_query,
+            include_archived=include_archived_param,
+            archived_only=archived_only_param,
+        )
+        items: list[SessionListItem] = []
+        user_is_admin = (
+            await asyncio.to_thread(permission_store.is_admin, user_id)
+            if page.data and permission_store is not None and user_id is not None
+            else False
+        )
+        # Expanded families can contain many more rows than the source page.
+        for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
+            # list_conversations may return rows with agent_id=None for
+            # legacy conversations; skip them before building the batch IDs.
+            conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
+            if not conv_ids:
+                continue
+            # Batch-fetch permissions and agent metadata concurrently.
+            # The tasks table has been removed — status comes exclusively from
+            # the relay-fed ``_session_status_cache``.
+            perms_by_conv: dict[str, list[SessionPermission]]
+            if permission_store is not None:
+                perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
                 )
-            ]
-            if orphan_suspects:
-                orphan_liveness = await asyncio.to_thread(
-                    liveness_lookup, [conv.id for conv in orphan_suspects]
+            else:
+                agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
                 )
-                for conv in orphan_suspects:
-                    result = orphan_liveness.get(conv.id)
-                    # runner_online is False only once the runner is gone from
-                    # every replica (no tunnel anywhere AND runner_last_seen
-                    # stale past the TTL), so this fires for a genuinely
-                    # orphaned runner, never one mid-reconnect within grace.
-                    if result is not None and not result.runner_online:
-                        await asyncio.to_thread(
-                            reconcile_orphaned_running_status,
-                            conv.id,
-                            conversation_store,
-                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                perms_by_conv = {}
+            agent_names_by_id, harnesses_by_id = agent_metadata
+            # In-memory lookup — no I/O, so batching avoids re-acquiring
+            # the index's lock per row but otherwise has no DB cost.
+            pending_counts = pending_elicitations.counts_for(conv_ids)
+            comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+            pull_requests = await _pull_requests_for(conv_ids)
+            # Settle orphaned running/waiting rows only after stale heartbeats
+            # and a missing local cache entry justify a cross-replica probe.
+            if liveness_lookup is not None:
+                orphan_suspects = [
+                    conv
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                    and conv.runner_id is not None
+                    and conv.live_status in ("running", "waiting")
+                    and _session_status_cache.get(conv.id) is None
+                    and not runner_seen_is_fresh(conv.runner_last_seen)
+                    and (
+                        permission_store is None
+                        or _permission_level_from_grants(
+                            user_id,
+                            perms_by_conv.get(conv.id, []),
+                            user_is_admin,
                         )
-        # Build items after reconciliation so each settled row reads its new
-        # status straight from the (now-updated) cache.
-        items: list[SessionListItem] = [
-            _build_session_list_item(
-                conv,
-                agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
-                user_id=user_id,
-                user_is_admin=user_is_admin,
-                permissions_enabled=permission_store is not None,
-                pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
+                        == LEVEL_OWNER
+                    )
+                ]
+                if orphan_suspects:
+                    orphan_liveness = await asyncio.to_thread(
+                        liveness_lookup, [conv.id for conv in orphan_suspects]
+                    )
+                    for conv in orphan_suspects:
+                        result = orphan_liveness.get(conv.id)
+                        # False means no replica has a tunnel and the heartbeat
+                        # expired, so reconnecting runners within grace survive.
+                        if result is not None and not result.runner_online:
+                            await asyncio.to_thread(
+                                reconcile_orphaned_running_status,
+                                conv.id,
+                                conversation_store,
+                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            )
+            # Build items after reconciliation so each settled row reads its new
+            # status straight from the (now-updated) cache.
+            items.extend(
+                [
+                    _build_session_list_item(
+                        conv,
+                        agent_names_by_id=agent_names_by_id,
+                        harness=harnesses_by_id.get(conv.id),
+                        grants=perms_by_conv.get(conv.id, []),
+                        user_id=user_id,
+                        user_is_admin=user_is_admin,
+                        permissions_enabled=permission_store is not None,
+                        pending_count=pending_counts.get(conv.id, 0),
+                        child_session_ids=child_ids_by_parent[conv.id],
+                        comments_fingerprint=comments_fingerprints.get(conv.id),
+                        pull_request=pull_requests.get(conv.id, (None, None))[0],
+                        pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                    )
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                ]
             )
-            for conv in page.data
-            if conv.agent_id is not None
-        ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
@@ -1367,12 +2390,14 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
-        return PaginatedList(
+        result = PaginatedList(
             data=[item.model_dump(exclude_none=True) for item in items],
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
-        )
+        ).model_dump()
+        result["page_boundary"] = page_boundary
+        return result
 
     async def _comments_fingerprints_for(
         conv_ids: list[str],
@@ -1395,6 +2420,46 @@ def register_core_routes(
         if comment_store is None or not conv_ids:
             return {}
         return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _pull_requests_for(
+        conv_ids: list[str],
+    ) -> dict[str, tuple[SessionPullRequestSummary | None, bool]]:
+        """
+        Batch-fetch each session's first linked pull request in one query.
+
+        Shared by the ``GET /v1/sessions`` page builder and
+        ``WS /v1/sessions/updates``, so a PR the host reports reaches the
+        sidebar and canvas through the stream's diff. Listed sessions the
+        server hasn't imported, or whose first open PR is stale, are
+        refreshed from their runner or host in the background.
+
+        :param conv_ids: Session ids to summarize, e.g. ``["conv_abc123"]``.
+        :returns: Map from session id to its first PR (or ``None``) and whether
+            it is synced; the map is empty without PR storage.
+        """
+        if pull_request_store is None or not conv_ids:
+            return {}
+        try:
+            summaries = await asyncio.to_thread(pull_request_store.summaries, conv_ids)
+        except Exception:  # The list must load even if PR storage fails.
+            _logger.warning("Could not load session pull requests", exc_info=True)
+            return {}
+        now = time.time()
+        if pull_request_refresher is not None:
+            for conv_id, summary in summaries.items():
+                if server_prs.needs_refresh(summary, now=now):
+                    pull_request_refresher.request(conv_id)
+        return {
+            conv_id: (
+                SessionPullRequestSummary(**server_prs.primary_summary(summary.primary))
+                if summary.primary is not None
+                else None,
+                summary.synced,
+            )
+            for conv_id, summary in summaries.items()
+        }
 
     # ── WS /sessions/updates ────────────────────────────────────
 
@@ -1464,21 +2529,33 @@ def register_core_routes(
         convs = await asyncio.to_thread(_load_sessions, accessible)
         if not convs:
             return []
-        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
+        from omnigent.server.session_families import project_families
+
+        convs, family_info = await asyncio.to_thread(
+            project_families, conversation_store, permission_store, convs, user_id
+        )
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+        (
+            agent_metadata,
+            child_ids_by_parent,
+            comments_fingerprints,
+            pull_requests,
+        ) = await asyncio.gather(
+            asyncio.to_thread(_session_agent_metadata, convs),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
+            _pull_requests_for(conv_ids),
         )
+        agent_names_by_id, harnesses_by_id = agent_metadata
         pending_counts = pending_elicitations.counts_for(conv_ids)
         items = [
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                harness=harnesses_by_id.get(conv.id),
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -1486,9 +2563,15 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                pull_request=pull_requests.get(conv.id, (None, None))[0],
+                pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
             )
             for conv in convs
         ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached
@@ -1527,7 +2610,10 @@ def register_core_routes(
           per ``watch`` (full state for the new set), then
           ``{"type": "changed", "items": [...]}`` /
           ``{"type": "removed", "ids": [...]}`` deltas as watched
-          sessions change, and ``{"type": "heartbeat"}`` when idle.
+          sessions change, ``{"type": "access_changed", "ids": [...]}``
+          when a watched session is newly shared with the user (its row
+          may be unchanged, so list membership must be re-read), and
+          ``{"type": "heartbeat"}`` when idle.
 
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
@@ -1550,6 +2636,10 @@ def register_core_routes(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection, so the
+        # binding cannot leak across sockets.
+        set_current_user_id(user_id)
         await websocket.accept()
         _logger.info(
             "session-updates stream connected",
@@ -1727,12 +2817,16 @@ def register_core_routes(
                     if not isinstance(sid, str):
                         continue
                     async with emit_lock:
-                        # Already watched ⇒ the normal diff already covers it.
-                        if sid in watched:
-                            continue
                         try:
                             items = await _fetch_watched_items([sid], user_id)
-                            if items:
+                            if items and sid in watched:
+                                # The interval diff covers the row, but a grant
+                                # that leaves the row unchanged (e.g. a direct
+                                # read share of a session already readable by
+                                # link) emits no delta. Tell the client its access
+                                # changed so it re-reads list membership.
+                                await _send({"type": "access_changed", "ids": [sid]})
+                            elif items:
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:
                             # Client gone mid-send — propagate to tear the stream down.
@@ -1964,6 +3058,7 @@ def register_core_routes(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
@@ -1979,6 +3074,8 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
+        :param include_usage: When ``False``, skip usage aggregation in the
+            response. Metadata writes during native launch do not need it.
         :returns: The updated :class:`SessionResponse` snapshot, with
             ``items`` always empty — PATCH callers use only scalar
             fields, and transcripts are served by
@@ -1986,7 +3083,29 @@ def register_core_routes(
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
+        # A live effort/model change must read the settings its predecessor confirmed
+        # or restored; otherwise a refusal can restore a value Codex never applied.
+        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+            live_change = _live_settings_change(session_id)
+            async with live_change.lock:
+                return await _update_session(request, session_id, body, include_usage, live_change)
+        return await _update_session(request, session_id, body, include_usage)
+
+    async def _update_session(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        include_usage: bool,
+        live_change: _LiveSettingsChange | None = None,
+    ) -> SessionResponse:
+        """Apply the PATCH that :func:`update_session` documents."""
+        began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
+        if body.delete_worktree and body.archived is not True:
+            raise OmnigentError(
+                "delete_worktree is only valid with archived=true",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # This PATCH gates at the least level the request actually needs, in
         # three tiers matching the if/elif/else below:
         #
@@ -1996,7 +3115,8 @@ def register_core_routes(
         #   session may pin it — including a read-only collaborator on a session
         #   shared with them. Only when the pinned label is the request's ONLY
         #   mutation.
-        # * OWNER — archiving/unarchiving or filing into a project. Both are
+        # * OWNER — launch arguments and permission mode control host execution.
+        #   Archiving/unarchiving and filing into a project are also
         #   owner-only: projects are owner-private (an editor must not move a
         #   session between them), and archive pairs with a client-driven,
         #   owner-gated stop (an editor must not hide/stop a session they can't
@@ -2013,13 +3133,19 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_launch_args = (
+            body.terminal_launch_args is not None
+            or body.permission_mode is not None
+            or body.approval_mode is not None
+            or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+        )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif body.archived is not None or set_project or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -2087,16 +3213,11 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
-        requested_claude_permission_mode: str | None = None
+        requested_permission_mode: str | None = None
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
                     "permission_mode must be a non-empty string",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            if body.permission_mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
-                raise OmnigentError(
-                    f"permission_mode must be one of {sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             conv_for_permission_mode = await asyncio.to_thread(
@@ -2105,15 +3226,30 @@ def register_core_routes(
             )
             if conv_for_permission_mode is None:
                 raise _session_not_found()
-            if (
-                conv_for_permission_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-            ):
+            # The mode lives in the harness's own TUI, so both the eligible wrapper
+            # and the vocabulary are per harness — Devin's rungs are not Claude's,
+            # and validating one against the other would reject a valid switch.
+            wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
+                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
+            )
+            if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+                allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
+            elif wrapper_for_permission_mode == _DEVIN_NATIVE_WRAPPER_LABEL_VALUE:
+                from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
+
+                allowed_permission_modes = DEVIN_PERMISSION_MODES
+            else:
                 raise OmnigentError(
-                    "permission_mode is only supported for claude-native sessions",
+                    "permission_mode is only supported for claude-native and "
+                    "devin-native sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            requested_claude_permission_mode = body.permission_mode
+            if body.permission_mode not in allowed_permission_modes:
+                raise OmnigentError(
+                    f"permission_mode must be one of {sorted(allowed_permission_modes)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_permission_mode = body.permission_mode
         approval_mode_requested = "approval_mode" in body.model_fields_set
         requested_codex_approval_mode: str | None = None
         if approval_mode_requested:
@@ -2142,7 +3278,64 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
+        family_pin_value: str | None = None
+        if body.family_pinned is not None:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Family pins require ownership", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_owned_session, session_id, user_id, conversation_store, permission_store
+            )
+            family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
+        if PROJECT_LABEL_KEY in labels_to_set and (
+            not set_project or labels_to_set[PROJECT_LABEL_KEY]
+        ):
+            project_source = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if project_source and project_source.family_id is not None:
+                raise OmnigentError(
+                    "Move a session family through its representative's project action",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if PINNED_LABEL_KEY in labels_to_set:
+            from omnigent.stores.conversation_store import family_pinned_label_key
+
+            pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            owner_grant = (
+                await asyncio.to_thread(permission_store.get, user_id, session_id)
+                if permission_store is not None and user_id is not None
+                else None
+            )
+            if (
+                pin_source is not None
+                and pin_source.family_id is not None
+                and (
+                    permission_store is None
+                    or (
+                        user_id is not None
+                        and owner_grant is not None
+                        and owner_grant.level == LEVEL_OWNER
+                    )
+                )
+            ):
+                members = await asyncio.to_thread(
+                    conversation_store.get_session_family, session_id
+                )
+                active = [member for member in members if not member.archived]
+                retained = active or members
+                family_pin_key = family_pinned_label_key(user_id)
+                if (
+                    retained
+                    and retained[0].id == session_id
+                    and (
+                        family_pin_key in pin_source.labels
+                        or pinned_label_key(user_id) not in pin_source.labels
+                    )
+                ):
+                    family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -2194,6 +3387,29 @@ def register_core_routes(
                     f"invalid model_override: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if model_override is not None:
+            conv_for_model = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_model is None:
+                raise _session_not_found()
+            from omnigent.server.routes.sandbox_inference import (
+                configured_snapshot,
+                validate_saved_selection,
+            )
+
+            if configured_snapshot(conv_for_model.inference_snapshot):
+                model_override = await validate_saved_selection(
+                    request, conv_for_model, None if clear_model else model_override
+                )
+                clear_model = False
+            else:
+                await asyncio.to_thread(
+                    _validate_session_model_selection,
+                    conv_for_model,
+                    None if clear_model else model_override,
+                    agent_store,
+                )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -2231,26 +3447,134 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        previous_runner_id = conv.runner_id
+        previous_runner_binding = conv
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
         if body.runner_id is not None:
+            add_audit_attrs(
+                previous_runner_id=previous_runner_id,
+                previous_host_id=conv.host_id,
+                requested_runner_id=body.runner_id
+                if len(body.runner_id) <= 256
+                and body.runner_id.isascii()
+                and (body.runner_id == "" or body.runner_id.isprintable())
+                else None,
+                binding_action="clear" if body.runner_id == "" else "bind",
+            )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
                 try:
-                    await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                    if profile_catalog is not None:
+                        await asyncio.to_thread(
+                            profile_catalog.reassign_runner,
+                            conv,
+                            None,
+                            conversation_store=conversation_store,
+                            host_store=getattr(request.app.state, "host_store", None),
+                            user_id=user_id,
+                        )
+                    else:
+                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                _logger.info(
+                    "Session unbound from runner",
+                    extra=debug_event(
+                        "session_runner_unbound",
+                        session_id=session_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
+                    ),
+                )
             else:
                 from omnigent.server.routes import sessions as _sf
 
+                if (
+                    runner_router is not None
+                    and conv.host_id is None
+                    and conv.kind == "default"
+                    and conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                    and not runner_router.runner_is_online(body.runner_id.strip())
+                ):
+                    host_id = await asyncio.to_thread(
+                        routing_host_id,
+                        dataclasses.replace(conv, runner_id=body.runner_id.strip()),
+                        conversation_store,
+                    )
+                    if host_id is not None and await asyncio.to_thread(
+                        runner_router.host_is_on_another_replica, host_id
+                    ):
+                        raise OmnigentError(
+                            "side chat runner is connected to another server replica",
+                            code=ErrorCode.WRONG_REPLICA,
+                        )
                 runner_id = _sf._registered_runner_id(
                     runner_router, body.runner_id, user_id=user_id
                 )
-                try:
+                if runner_router is not None:
                     await asyncio.to_thread(
-                        conversation_store.replace_runner_id, session_id, runner_id
+                        runner_router.require_mcp_registry_support,
+                        dataclasses.replace(conv, runner_id=runner_id),
                     )
+                try:
+                    if (
+                        conv.family_id is not None
+                        and runner_id != conv.runner_id
+                        and request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS)
+                    ):
+                        from omnigent.server.session_families import require_sibling_destination
+
+                        runner_hosts = await asyncio.to_thread(
+                            conversation_store.get_runner_host_ids, runner_id
+                        )
+                        await asyncio.to_thread(
+                            require_sibling_destination,
+                            request,
+                            conv.host_id,
+                            host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
+                            host_type="external",
+                        )
+                    handled = profile_catalog is not None and await asyncio.to_thread(
+                        profile_catalog.reassign_runner,
+                        conv,
+                        runner_id,
+                        conversation_store=conversation_store,
+                        host_store=getattr(request.app.state, "host_store", None),
+                        user_id=user_id,
+                    )
+                    if not handled:
+                        if profile_catalog is None:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id, session_id, runner_id
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                runner_id,
+                                expected_binding=conv,
+                            )
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                except ValueError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+                set_current_runner_id(runner_id)
+                _logger.info(
+                    "Session bound to runner",
+                    extra=debug_event(
+                        "session_runner_bound",
+                        session_id=session_id,
+                        runner_id=runner_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
+                        operation="bind",
+                        stage="runner_launch",
+                    ),
+                )
                 _runner_client = await _get_runner_client(
                     session_id,
                     runner_router,
@@ -2262,19 +3586,20 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
-                if _runner_client is not None and conv is not None:
+                parent_initialized = False
+                if _runner_client is not None and conv is not None and conv.agent_id is not None:
+                    # The versioned snapshot keeps harness_override on rebind.
+                    # Recovery runs the pending kickoff, except a side chat's copied turn.
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=build_runner_session_init_payload(
+                                conv,
+                                server_version=VERSION,
+                                suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
+                            ),
                             timeout=10.0,
                         )
-                        if runner_init_resp.status_code < 400:
-                            await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).
@@ -2283,6 +3608,62 @@ def register_core_routes(
                             session_id,
                             exc_info=True,
                         )
+                    else:
+                        from omnigent.server.runner_session_init import runner_inference_verified
+
+                        parent_initialized = (
+                            runner_init_resp.status_code < 400
+                            and runner_inference_verified(conv, runner_init_resp)
+                        )
+                if (
+                    conv is not None
+                    and conv.inference_snapshot is not None
+                    and not parent_initialized
+                ):
+                    if handled:
+                        restored = await asyncio.to_thread(
+                            conversation_store.rollback_runner_reassignment,
+                            previous_runner_binding,
+                            expected_runner_id=runner_id,
+                            expected_host_id=conv.host_id,
+                        )
+                        if not restored:
+                            _logger.info(
+                                "Retaining a newer binding or the last runner/host association"
+                            )
+                    elif profile_catalog is None:
+                        if previous_runner_id is None:
+                            await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                        else:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                previous_runner_id,
+                            )
+                    else:
+                        rollback_binding = dataclasses.replace(
+                            previous_runner_binding, runner_id=runner_id
+                        )
+                        try:
+                            if previous_runner_id is None:
+                                await asyncio.to_thread(
+                                    conversation_store.clear_runner_id,
+                                    session_id,
+                                    expected_binding=rollback_binding,
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    conversation_store.replace_runner_id,
+                                    session_id,
+                                    previous_runner_id,
+                                    expected_binding=rollback_binding,
+                                )
+                        except ValueError:
+                            _logger.info("Retaining a newer runner/host binding")
+                    raise OmnigentError(
+                        "The runner did not accept this session's saved inference configuration",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no
@@ -2300,7 +3681,19 @@ def register_core_routes(
                     runner_id,
                     _runner_client,
                     conversation_store,
+                    conversation=conv,
                 )
+                if parent_initialized:
+                    assert conv is not None and _runner_client is not None
+                    await _publish_runner_recovered_status(session_id, conversation_store)
+                    from omnigent.server.child_session_recovery import restore_active_children
+
+                    await restore_active_children(
+                        conv,
+                        _runner_client,
+                        conversation_store,
+                        request.app.state.runner_session_initializer,
+                    )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:
@@ -2313,8 +3706,93 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
 
-        updated = await asyncio.to_thread(
-            conversation_store.update_conversation,
+        from omnigent.server.routes.sandbox_inference import configured_snapshot
+
+        if (
+            conv is not None
+            and configured_snapshot(conv.inference_snapshot)
+            and (cost_control_mode_override == "on" or subagent_routing_override == "on")
+        ):
+            raise OmnigentError(
+                "Automatic provider routing is unavailable for a bound inference profile",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        # Ephemeral side threads have no terminal; apply their saved picks on the next turn.
+        defer_side_settings = (
+            conv is not None
+            and _is_codex_native_subagent(conv)
+            and is_side_chat_child(conv.labels)
+        )
+        if defer_side_settings and clear_model:
+            raise OmnigentError(
+                "Choose a specific model for this side chat; resetting its model is not supported.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if (
+            defer_side_settings
+            and not body.silent
+            and (model_override is not None or clear_model or effort is not None or clear_effort)
+        ):
+            assert conv is not None
+            if not await _runner_supports_side_chat_settings(
+                conv, conversation_store, getattr(request.app.state, "tunnel_registry", None)
+            ):
+                raise OmnigentError(
+                    "This runner cannot apply side-chat settings. Update the host and restart the session.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+        live_model_change = (
+            not body.silent
+            and not defer_side_settings
+            and (model_override is not None or clear_model)
+        )
+        wake_for_model_change = (
+            live_model_change
+            and conv is not None
+            and conv.host_id is not None
+            and _is_native_terminal_session(conv)
+        )
+        if wake_for_model_change:
+            assert conv is not None
+            conv = await _wake_runner_for_model_change(
+                request, conv, conversation_store, runner_router
+            )
+
+        if set_project or family_pin_value is not None:
+            members = await asyncio.to_thread(conversation_store.get_session_family, session_id)
+            if family_pin_value is not None and (conv is None or conv.family_id is None):
+                raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
+            active = [member for member in members if not member.archived]
+            if members and (active or members)[0].id != session_id:
+                raise OmnigentError(
+                    "Only the family representative can move or pin the family",
+                    code=ErrorCode.CONFLICT,
+                )
+            if set_project:
+                for member in members:
+                    await _require_access(
+                        user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
+                    )
+                if body.project_id is None:
+                    raise OmnigentError(
+                        'project_id must be a project id or "" to unfile; '
+                        "omit the field to leave membership unchanged",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if body.project_id:
+                    if project_store is None:
+                        raise OmnigentError(
+                            "Filing a session into a project is not supported by this server",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    owned = await asyncio.to_thread(
+                        project_store.get, body.project_id, user_id=user_id
+                    )
+                    if owned is None:
+                        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        update_result = await asyncio.to_thread(
+            conversation_store.update_conversation_with_changes,
             session_id,
             title=body.title,
             reasoning_effort=None if clear_effort else effort,
@@ -2331,61 +3809,135 @@ def register_core_routes(
             # an omitted field leaves it unchanged; True/False set or clear it.
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
-            archived=body.archived,
+            label_updates=(
+                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
+                if defer_side_settings and (clear_effort or effort is not None)
+                else None
+            ),
         )
-        if updated is None:
+        if update_result is None:
             raise _session_not_found()
-        # Archiving hides the session from the default view (and its unread
-        # dot), so drop its per-user read-state to bound in-memory growth.
-        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
-        if body.archived is True:
-            _prune_session_read_state(session_id)
-            # Stop the session now that the flag is committed, so a request
-            # rejected after this point can't leave a stopped-but-unarchived
-            # session. Detached, not awaited: the response must not wait out
-            # the stop's per-runner timeouts (seconds against a wedged or
-            # asleep runner). Archive has no client-side stop, so this also
-            # carries the host-runner teardown.
-            _spawn_archive_stop(
+        updated = update_result.conversation
+        effort_changed = update_result.reasoning_effort_changed
+        saved = live_change.position() if live_change is not None else 0
+        if body.silent:
+            # An active live change orders this write against its own when refused.
+            _note_settings_write(
                 session_id,
-                conversation_store,
-                runner_router,
-                getattr(request.app.state, "host_registry", None),
+                {
+                    key: getattr(updated, key)
+                    for key in ("reasoning_effort", "model_override")
+                    if key in body.model_fields_set
+                },
             )
-        # Notify the runner of effort / model changes so harnesses
-        # that can't re-read these from store at turn boundaries
-        # (today: claude-native, whose ``claude`` binary has
-        # ``--effort`` / ``--model`` baked in at spawn) get a chance
-        # to propagate them live. Best-effort — persisted values
-        # remain the authoritative fallback. Skip both when
-        # ``silent`` so bind-time auto-apply doesn't inject visible
-        # ``/model X`` items into a fresh pane.
-        # Effort and model both go through the unified ``/events``
-        # dispatch — Omnigent server stays harness-agnostic; the runner
-        # dispatches by harness (claude-native injects the slash
-        # command into tmux, other harnesses 204 no-op). See
-        # ``_forward_session_change_to_runner`` for the shared
-        # runner-client fallback + non-2xx logging.
-        live_forward = not body.silent
-        if live_forward and (effort is not None or clear_effort):
-            await _forward_session_change_to_runner(
+        # The runner applies native settings live. Silent startup metadata
+        # writes skip both recovery and forwarding to avoid recursive launches.
+        live_forward = not body.silent and not defer_side_settings
+        codex_native = (
+            updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+        )
+        # This server rolls back Codex refusals and keeps unconfirmed changes, so the
+        # runner neither saves a refusal nor waits out this server's forward timeout.
+        negotiation: dict[str, object] = (
+            {"rollback_on_refusal": True, "cold_start_settings": True} if codex_native else {}
+        )
+        settings_forward_timeout = (
+            _CODEX_SETTINGS_FORWARD_TIMEOUT_S if codex_native else _TUI_INJECT_FORWARD_TIMEOUT_S
+        )
+        combined_model_forward = False
+        _model_forward = None
+        if (
+            live_forward
+            and (effort is not None or clear_effort)
+            and (effort_changed or (live_model_change and codex_native))
+        ):
+            effort_event: dict[str, object] = {
+                "type": "effort_change",
+                "effort": updated.reasoning_effort,
+                **negotiation,
+            }
+            combined_model_forward = bool(
+                live_model_change and updated.model_override and codex_native
+            )
+            event = (
+                {
+                    "type": "model_change",
+                    "model": updated.model_override,
+                    "effort": updated.reasoning_effort,
+                    **negotiation,
+                }
+                if combined_model_forward
+                else effort_event
+            )
+            effort_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": "effort_change", "effort": updated.reasoning_effort},
-                # Same TUI injection budget as the model change below: the
-                # ``/effort`` confirm dialog can render seconds after the
-                # command.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                event,
+                timeout_s=settings_forward_timeout,
             )
-        if live_forward and (model_override is not None or clear_model):
-            _model_forward = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "model_change", "model": updated.model_override},
-                # The runner answers this by typing ``/model`` into the pane and
-                # confirming the dialog, which outlasts the default budget.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+            model_applied = bool(
+                combined_model_forward
+                and effort_forward is not None
+                and 200 <= effort_forward.status_code < 300
             )
+            if combined_model_forward:
+                _model_forward = effort_forward
+            if model_applied and effort_forward is not None:
+                if _runner_reply_field(effort_forward.body, "codex_settings_applied") is not True:
+                    # Older runners apply only the model; reset against that
+                    # model after its update has completed.
+                    effort_forward = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        effort_event,
+                        timeout_s=settings_forward_timeout,
+                    )
+            if codex_native and (
+                (effort_forward is None and model_applied)
+                or (
+                    effort_forward is not None
+                    and not 200 <= effort_forward.status_code < 300
+                    and not _codex_update_unconfirmed(effort_forward)
+                    and (
+                        (combined_model_forward and not model_applied)
+                        or _runner_reply_field(effort_forward.body, "rollback_on_refusal") is True
+                    )
+                )
+            ):
+                # A live refusal must not leave the picker claiming unapplied settings.
+                # Older runners keep a refused effort themselves, so roll back only
+                # when the runner confirms it did not, or after a lost fallback reply.
+                restore_model = live_model_change and not model_applied
+                if conv is None:
+                    raise OmnigentError(
+                        "The terminal did not apply the settings change.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                await _restore_refused_settings(
+                    conversation_store,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_model=restore_model,
+                    live_change=live_change,
+                    began=began,
+                    saved=saved,
+                )
+                raise OmnigentError(
+                    _CODEX_SETTINGS_RESTORED_MESSAGE
+                    if restore_model
+                    else "The terminal did not apply the reasoning effort change. Please try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+        if live_model_change:
+            if not combined_model_forward:
+                _model_forward = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": "model_change", "model": updated.model_override, **negotiation},
+                    timeout_s=settings_forward_timeout,
+                )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
             # omnigent.ui, which chat-first SDK terminal-view sessions like
@@ -2393,15 +3945,61 @@ def register_core_routes(
             # full rationale. live_forward (== not silent) already excludes
             # bind-time auto-applies, so only an explicit /model lands a note.
             if _is_native_terminal_session(updated):
-                # The injection is the only thing that moves a LIVE native
-                # pane's model, so a forward its runner refused must not pass as
-                # applied. A stopped session reaches no runner and stays quiet —
-                # its relaunch reads the override off the row.
-                _surface_model_change_forward_failure(
-                    session_id,
-                    updated.model_override,
-                    _model_forward,
+                # Neither a lost request nor a refusal confirms a model switch, but an
+                # unconfirmed Codex update may still apply; the next turn re-applies it.
+                unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
+                    _model_forward
                 )
+                # A model the terminal can't select is a bad request, not a failed session.
+                unsupported = _unsupported_model_detail(_model_forward)
+                forward_failed = (
+                    unsupported is None
+                    and not unconfirmed
+                    and await _surface_model_change_forward_failure(
+                        session_id,
+                        updated.model_override,
+                        _model_forward,
+                        conversation_store,
+                    )
+                )
+                if conv is not None and (
+                    unsupported is not None
+                    or (wake_for_model_change and (_model_forward is None or forward_failed))
+                    or (forward_failed and configured_snapshot(conv.inference_snapshot))
+                ):
+                    if combined_model_forward:
+                        # The lost request also carried the effort, so restore both.
+                        await _restore_refused_settings(
+                            conversation_store,
+                            session_id,
+                            previous=conv,
+                            attempted=updated,
+                            restore_model=True,
+                            live_change=live_change,
+                            began=began,
+                            saved=saved,
+                        )
+                        raise OmnigentError(
+                            _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
+                        )
+                    await _restore_refused_settings(
+                        conversation_store,
+                        session_id,
+                        previous=conv,
+                        attempted=updated,
+                        restore_model=True,
+                        restore_effort=False,
+                        live_change=live_change,
+                        began=began,
+                        saved=saved,
+                    )
+                    if unsupported is not None:
+                        raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
+                    raise OmnigentError(
+                        "The terminal did not apply the model change. "
+                        "Please check the current selection and try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             else:
                 await _persist_model_change_note(
                     session_id,
@@ -2423,20 +4021,20 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        if requested_claude_permission_mode is not None and live_forward:
+        if requested_permission_mode is not None and live_forward:
             _mode_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {
                     "type": "permission_mode_change",
-                    "permission_mode": requested_claude_permission_mode,
+                    "permission_mode": requested_permission_mode,
                 },
             )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
             _confirmed_permission_mode = _require_permission_mode_forward(
                 session_id,
-                requested_claude_permission_mode,
+                requested_permission_mode,
                 _mode_result,
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
@@ -2465,6 +4063,10 @@ def register_core_routes(
                     "type": "codex_approval_mode_change",
                     "approval_mode": requested_codex_approval_mode,
                 },
+                # The runner drives Codex's /permissions popup — reading the rows,
+                # pressing the preset's digit, then confirming the echo — which
+                # outlasts the default forward budget.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Raises unless the runner drove the /permissions popup, so the label
             # can never claim a preset the Codex TUI wasn't switched to. Codex owns
@@ -2476,6 +4078,39 @@ def register_core_routes(
                 _approval_result,
             )
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+        if family_pin_value is not None:
+            await asyncio.to_thread(
+                conversation_store.set_family_pin, session_id, family_pin_value, user_id=user_id
+            )
+        if set_project:
+            filed = await asyncio.to_thread(
+                conversation_store.set_conversation_project, session_id, body.project_id or None
+            )
+            if not filed:
+                raise _session_not_found()
+        if body.archived is not None:
+            await asyncio.to_thread(
+                conversation_store.update_conversation, session_id, archived=body.archived
+            )
+        # Archiving hides the session from the default view (and its unread
+        # dot), so drop its per-user read-state to bound in-memory growth.
+        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True:
+            _prune_session_read_state(session_id)
+            # Stop asynchronously after the archive commits and Undo grace elapses.
+            # The deferred archived-flag check keeps an undone session's runner alive.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+                delete_worktree=body.delete_worktree,
+                host_store=getattr(request.app.state, "host_store", None),
+            )
+        elif body.archived is False:
+            # Cancel local teardown immediately; the deferred flag check handles
+            # Undo arriving on another replica.
+            _cancel_pending_archive_stop(session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
@@ -2537,51 +4172,11 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # File into a first-class project (owner-only, gated above). ``""``
-        # unfiles; a non-empty id must name a project the caller owns. Filing
-        # into another owner's (or a missing) project is rejected as NOT_FOUND
-        # — the same 404 the projects API returns, so we don't leak existence.
-        if set_project:
-            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
-            # not a valid value here (omitting the field is how you leave
-            # membership unchanged), so reject it rather than treating it as a
-            # destructive unfile.
-            if body.project_id is None:
-                raise OmnigentError(
-                    'project_id must be a project id or "" to unfile; '
-                    "omit the field to leave membership unchanged",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            target_project_id = body.project_id
-            if target_project_id == "":
-                unfiled = await asyncio.to_thread(
-                    conversation_store.set_conversation_project, session_id, None
-                )
-                if not unfiled:
-                    raise _session_not_found()
-            else:
-                if project_store is None:
-                    raise OmnigentError(
-                        "Filing a session into a project is not supported by this server",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, user_id=user_id
-                )
-                if owned is None:
-                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-                filed = await asyncio.to_thread(
-                    conversation_store.set_conversation_project,
-                    session_id,
-                    target_project_id,
-                )
-                if not filed:
-                    raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             level,
@@ -2589,9 +4184,13 @@ def register_core_routes(
             agent_cache,
             liveness_lookup=liveness_lookup,
             include_items=False,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
+            request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(user_id, session_id)
+        return snapshot
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
 
@@ -2614,7 +4213,7 @@ def register_core_routes(
 
         Deep-copies the source session's conversation items and
         clones the agent into a new session. When ``body.agent_id``
-        is set, the fork binds that built-in agent instead of the
+        is set, the fork binds that agent instead of the
         source's — switching harness (e.g. Claude-SDK → Claude Code,
         or Claude → Codex). The source's model settings carry over
         only within the same provider family; a same-family native
@@ -2653,7 +4252,8 @@ def register_core_routes(
         exists — and the sandbox is registered to the FORKING caller, not
         to the source session's owner. The fork's workspace is the
         repository named by ``body.workspace``, or the one the source
-        recorded when that field is omitted.
+        recorded when that field is omitted. ``body.host_id`` names the
+        fork's new sandbox host, as on a managed create.
 
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
@@ -2661,12 +4261,51 @@ def register_core_routes(
         :param body: The validated :class:`SessionForkRequest`.
         :returns: A :class:`SessionResponse` describing the newly
             created fork (status ``"idle"``).
-        :raises OmnigentError: 404 if *source_id* does not exist
-            or ``body.agent_id`` is not a bindable built-in agent;
-            403 if the caller lacks read access; 400 if the source
+        :raises OmnigentError: 404 if *source_id* does not exist or
+            ``body.agent_id`` names no agent; 403/404 if the caller
+            lacks read access on the source, or on the session that
+            owns a session-scoped ``body.agent_id``; 403 for a side chat
+            unless the caller owns the source's root session; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured.
+            for a sandbox this server has not configured; 409 if
+            ``body.host_id`` is already in use; 410 if the
+            source's agent was removed or a required bundle copy finds
+            its source missing.
+        """
+        fork = await _fork_session(request, source_id, body)
+        assert fork is not None
+        return fork
+
+    async def _fork_session(
+        request: Request,
+        source_id: str,
+        body: SessionForkRequest,
+        *,
+        before_item_id: str | None = None,
+        keep_sandbox_labels: bool = False,
+        copy_history: bool = True,
+        continue_source: bool = False,
+        fork_id: str | None = None,
+        validate_only: bool = False,
+    ) -> SessionResponse | None:
+        """Fork *source_id* as :func:`fork_session` documents.
+
+        :param before_item_id: Internal cutoff for rewind and clear: copy only
+            the items before this one, e.g. ``"msg_abc123"``.
+        :param keep_sandbox_labels: Copy the source's managed-sandbox labels,
+            for a fork that stays in the source's sandbox.
+        :param copy_history: ``False`` copies none of the source's items or
+            files, whatever it holds when the fork commits.
+        :param continue_source: Create the fork on the source's host and
+            workspace, with its routing switches, as a same-owner continuation;
+            it gets no creation-default sharing nor owner grant (the caller sets
+            its grants), is not announced here, and the response carries no
+            items or permission.
+        :param fork_id: Id to create the fork under, e.g. so a caller can
+            remove it by id even if this call fails part-way.
+        :param validate_only: Run every check that could refuse the fork, then
+            return ``None`` without creating anything.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -2680,45 +4319,127 @@ def register_core_routes(
                     f"Session not found: {source_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
+        if body.side_chat and not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            source,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+            )
         if source.agent_id is None:
             raise OmnigentError(
                 "Source session has no agent binding — cannot fork.",
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
-        if source_agent is None:
-            raise OmnigentError(
-                f"Source agent not found: {source.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
+        sandbox_profile = await prepare_profile(
+            request, body, user_id=user_id, inherited_session_id=source_id
+        )
+        if sandbox_profile is not None and body.host_type == "managed":
+            body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
 
-        # By default the fork clones the source's agent (same harness). When
-        # ``body.agent_id`` names a different agent, the fork SWITCHES to it
-        # — e.g. fork a Claude-SDK session into Claude Code. Only built-in
-        # agents (``session_id IS NULL``) are bindable: a session-scoped
-        # agent belongs to one conversation (possibly another user's) and
-        # must never be cloned across sessions.
-        base_agent = source_agent
+        from omnigent.server.routes.sandbox_inference import (
+            actual_harness,
+            configured_snapshot,
+            validate_saved_selection,
+        )
+
+        source_configured = configured_snapshot(source.inference_snapshot)
+        if source.inference_snapshot is not None:
+            from omnigent.server.auth import RESERVED_USER_LOCAL
+
+            assert source.inference_snapshot is not None
+            if source.inference_snapshot["owner_id"] != (user_id or RESERVED_USER_LOCAL):
+                raise OmnigentError(
+                    "This session's inference configuration belongs to another user. "
+                    "Start a new session to use your own provider connection.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         target_agent_id = body.agent_id
         switching_agent = target_agent_id is not None and target_agent_id != source.agent_id
-        if target_agent_id is not None and switching_agent:
-            target_agent = await asyncio.to_thread(agent_store.get, target_agent_id)
-            if target_agent is None or target_agent.session_id is not None:
-                raise OmnigentError(
-                    f"Agent not found or not bindable: {target_agent_id!r}",
-                    code=ErrorCode.NOT_FOUND,
-                )
-            base_agent = target_agent
+        if source_agent is None and not switching_agent:
+            # The agent was removed: forking into another agent still works.
+            raise agent_removed()
 
-        # Clone params for the fork's session-scoped agent. Created inside
-        # fork_conversation's transaction (not agent_store.create): a
-        # pre-created row would survive a fork failure as an orphaned
-        # session_id=NULL built-in polluting the picker. Session-scoped rows
-        # are exempt from the unique built-in-name index, so the clone reuses
-        # the source's name verbatim — no "(fork …)" suffix needed.
-        cloned_agent_id = generate_agent_id()
-        cloned_agent_name = base_agent.name
+        # By default the fork uses the source's agent (same harness). When
+        # ``body.agent_id`` names a different agent, the fork SWITCHES to it
+        # (e.g. fork a Claude-SDK session into Claude Code). A target another
+        # session uses is bindable if the caller can read that session.
+        base_agent = source_agent
+        if target_agent_id is not None and switching_agent:
+            from omnigent.server.routes._session_create_validation import (
+                validate_session_agent,
+            )
+
+            base_agent = await validate_session_agent(
+                user_id=user_id,
+                agent_id=target_agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+        assert base_agent is not None
+
+        if source.inference_snapshot is not None and switching_agent:
+            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.inference_config import resolve_bound_provider
+            from omnigent.runtime import get_agent_cache
+
+            assert source.inference_snapshot is not None
+            cache = agent_cache or get_agent_cache()
+            try:
+                target_spec = (
+                    await asyncio.to_thread(cache.load, base_agent.id, base_agent.bundle_location)
+                ).spec
+            except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+                raise OmnigentError(
+                    "Cannot load the target agent to validate its saved inference configuration",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            source_harness = source.inference_snapshot["harness"]
+            target_harness = actual_harness(target_spec)
+            same_harness = (
+                source_harness == target_harness
+                if source_harness.startswith("acp:") or target_harness.startswith("acp:")
+                else canonicalize_harness(source_harness) == canonicalize_harness(target_harness)
+            )
+            if not same_harness:
+                raise OmnigentError(
+                    "A configured session can only fork into the same harness. "
+                    "Start a new session to choose another harness and provider.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            bound_provider = resolve_bound_provider(
+                source.inference_snapshot["runtime_config"],
+                source_harness,
+                target_spec.executor.auth,
+            )
+            if bound_provider is not None and target_spec.executor.profile:
+                raise OmnigentError(
+                    "The target agent's Databricks profile conflicts with the saved provider. "
+                    "Start a new session to use that agent.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            source_id,
+            base_agent,
+            conversation_store,
+            file_store,
+            up_to_response_id=body.up_to_response_id,
+        )
+
+        # Cross-user forks copy the agent (bundle under the copy's id) so its owner
+        # can never change code in the caller's sessions; same-user forks share it.
+        needs_own_copy = agent_needs_own_copy(base_agent, user_id)
+        if needs_own_copy and artifact_store is None:
+            raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
 
         # A model id is provider-bound, so the source's model_override /
         # reasoning_effort only carry over when the switch stays in the same
@@ -2726,7 +4447,7 @@ def register_core_routes(
         # family) resets them; same-agent forks always copy.
         copy_model_settings = True
         if switching_agent:
-            copy_model_settings = await asyncio.to_thread(
+            copy_model_settings = source_agent is not None and await asyncio.to_thread(
                 _same_provider_family, source_agent, base_agent
             )
 
@@ -2761,6 +4482,16 @@ def register_core_routes(
                 # Explicit JSON null clears the override (matches the clear
                 # aliases), so the fork falls back to the bound agent default.
                 clear_override_model = True
+
+        if source_configured:
+            selected_model = (
+                (None if clear_override_model else override_model)
+                if model_override_set
+                else source.model_override
+            )
+            override_model = await validate_saved_selection(request, source, selected_model)
+            clear_override_model = False
+            model_override_set = True
 
         override_effort: str | None = None
         clear_override_effort = False
@@ -2804,7 +4535,12 @@ def register_core_routes(
         # otherwise ride along as stale metadata that could hydrate a wrong mode
         # in generic native-wrapper UI state. Drop it whenever the agent changes.
         if switching_agent:
+            from omnigent.mcp_selection import MCP_SELECTION_PREFIX
+
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.update(
+                key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -2814,7 +4550,9 @@ def register_core_routes(
         # bound target is actually codex-native (the label is inert elsewhere,
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
-        extra_labels: dict[str, str] = {}
+        extra_labels: dict[str, str] = {
+            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
+        }
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":
@@ -2823,6 +4561,30 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+
+        # Side chats use the source for shared-runner routing and stay hidden
+        # from the sidebar while appearing in the Workspace rail.
+        if body.side_chat:
+            extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+            extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
+
+        # A managed fork's chosen sandbox host id is born with the row, as on a
+        # create: the caller routes the fork by it until its host binds, so no
+        # read of the row may miss it. The source's own id was dropped above.
+        if body.host_type == "managed" and body.host_id is not None:
+            from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+            extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
+        # A fork staying in the source's sandbox keeps what its relaunch
+        # re-clones (repositories) and how its host routes.
+        if keep_sandbox_labels:
+            from omnigent.server.managed_hosts import MANAGED_SANDBOX_LABEL_NAMESPACE
+
+            extra_labels.update(
+                (key, value)
+                for key, value in source.labels.items()
+                if key.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)
+            )
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -2841,6 +4603,9 @@ def register_core_routes(
         # _agent_carries_cursor_fork_history). The single FORK_CARRY_HISTORY
         # label drives both; the runner branches on harness.
         target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, base_agent)
+        target_forks_opencode = await asyncio.to_thread(
+            _agent_forks_opencode_native_session, base_agent
+        )
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
@@ -2850,13 +4615,14 @@ def register_core_routes(
         # runner takes the rebuild path instead of a doomed clone attempt
         # (a failed clone launches fresh, losing history). cursor never clones a
         # native session (server-backed; it carries history via the preamble),
-        # so it always skips the source directive too. A managed fork gets its
-        # OWN fresh sandbox, whose filesystem has no copy of the source's local
-        # native rollout, so the clone is likewise doomed — skip the directive
-        # so the runner rebuilds from the copied Omnigent items instead.
+        # so it skips the source directive; opencode keeps it to fork the
+        # source session natively. A managed fork gets its OWN fresh sandbox,
+        # whose filesystem has no copy of the source's local native rollout,
+        # so the clone is likewise doomed — skip the directive so the runner
+        # rebuilds from the copied Omnigent items instead.
         resume_source_native_session = (
             (not switching_agent or copy_model_settings)
-            and not target_is_cursor
+            and (not target_is_cursor or target_forks_opencode)
             and body.host_type != "managed"
         )
 
@@ -2913,15 +4679,89 @@ def register_core_routes(
         else:
             fork_project_id = fork_resolution.project_id
 
+        # The deep-copied items reference the source's session-scoped file
+        # resources by raw file_id (attachment blocks are persisted
+        # pre-resolution), but a fork owns none of those rows — its own file
+        # endpoints would 404, so the web transcript shows broken
+        # attachments and a native transcript rebuild receives the file_id
+        # unresolved. Pre-allocate a fork-owned id per source file; the store
+        # rewrites the copied items to those ids, and a fork-owned row per id
+        # is created right after the fork commits. Each row points at the
+        # SOURCE's blob (blob_key), so the fork shares the bytes and copies
+        # nothing — reference-counted deletion keeps that blob alive until
+        # every referencing row is gone.
+        #
+        # This is pure metadata: we deliberately do NOT probe the artifact
+        # store for each blob (an S3 HEAD / Volumes stat per file is real
+        # per-fork latency). A file whose blob happens to be gone yields a
+        # fork row that 404s on read — exactly how the source itself already
+        # degrades — so a probe would only trade latency for the same outcome.
+        fork_file_id_map: dict[str, str] = {}
+        fork_source_files: list[StoredFile] = []
+        if copy_history and file_store is not None and artifact_store is not None:
+            files_after: str | None = None
+            while True:
+                files_page = await asyncio.to_thread(
+                    file_store.list,
+                    source_id,
+                    limit=1000,
+                    after=files_after,
+                    order="asc",
+                )
+                for stored_file in files_page.data:
+                    fork_source_files.append(stored_file)
+                    fork_file_id_map[stored_file.id] = generate_file_id()
+                if not files_page.has_more or not files_page.data:
+                    break
+                files_after = files_page.last_id
+
+            from omnigent.inner.native_attachments import uses_filesystem_delivery
+
+            filesystem_sources = [
+                stored
+                for stored in fork_source_files
+                if uses_filesystem_delivery(stored.filename, stored.source_metadata)
+            ]
+            if filesystem_sources:
+                await asyncio.to_thread(
+                    _enforce_filesystem_attachment_policy,
+                    [stored.filename or "" for stored in filesystem_sources],
+                    session_id=None,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
+                )
+
+        if body.host_id is not None:
+            await _check_requested_host_id(request, body.host_id, user_id)
+
+        if validate_only:
+            return None
+        # Copied last, after every validation above; the copy row itself is
+        # inserted inside fork_conversation's transaction.
+        fork_agent_id = base_agent.id
+        clone_location: str | None = None
+        if needs_own_copy:
+            assert artifact_store is not None
+            fork_agent_id = generate_agent_id()
+            clone_location = await asyncio.to_thread(
+                copy_agent_bundle, artifact_store, base_agent.bundle_location, fork_agent_id
+            )
+
+        async def drop_unused_copy() -> None:
+            if clone_location is not None and artifact_store is not None:
+                await asyncio.to_thread(
+                    _delete_stored_session_bundle_after_failure, artifact_store, clone_location
+                )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
                 title=body.title,
-                agent_id=cloned_agent_id,
-                cloned_agent_name=cloned_agent_name,
-                cloned_agent_bundle_location=base_agent.bundle_location,
-                cloned_agent_description=base_agent.description,
+                agent_id=fork_agent_id,
+                cloned_agent_name=base_agent.name if clone_location else None,
+                cloned_agent_bundle_location=clone_location,
+                cloned_agent_description=base_agent.description if clone_location else None,
                 copy_model_settings=copy_model_settings,
                 # Explicit run-config picks from the fork dialog. Each rides a
                 # (value, set-flag) pair so the store can tell "override to
@@ -2946,56 +4786,132 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                before_item_id=before_item_id,
+                copy_items=copy_history,
+                continue_source=continue_source,
+                conversation_id=fork_id,
                 project_id=fork_project_id,
+                file_id_map=fork_file_id_map,
+                created_by=user_id,
+                side_chat_parent_id=source.id if body.side_chat else None,
             )
         except LookupError as exc:
+            await drop_unused_copy()
             raise OmnigentError(
                 f"Session not found: {source_id!r}",
                 code=ErrorCode.NOT_FOUND,
             ) from exc
         except ValueError as exc:
+            await drop_unused_copy()
             # Store raises ValueError when up_to_response_id names no
             # response in the source conversation (stale client state).
             raise OmnigentError(
                 str(exc),
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        except Exception:
+            await drop_unused_copy()
+            raise
+
+        try:
+            await record_profile(request, new_conv.id, sandbox_profile, conversation_store)
+        except Exception:
+            if clone_location is not None:
+                await _delete_unreturned_agent_copy(new_conv.id, fork_agent_id, clone_location)
+            raise
+
+        # Create the fork-owned rows the rewritten items now reference —
+        # before the fork is announced or returned, so no reader sees the ids
+        # dangling. Each row points at the SOURCE's blob (blob_key), so no
+        # bytes move: the fork shares the source's artifact and both sessions
+        # resolve the same content independently, and the source's
+        # source_metadata (e.g. an image's pre-downscale dimensions) is
+        # carried so the fork's copy is not left less descriptive than the
+        # original. Row creation is best-effort and touches no artifact store:
+        # a failed create is logged and skipped — nothing to roll back since
+        # no blob was written — so forking never fails on a deleted file, and
+        # a source file whose blob is already gone just yields a row that
+        # 404s on read, exactly as the source already does.
+        #
+        # Accepted residual race (not closed here): a source-file/session
+        # delete that runs fully concurrently with this fork can pass its
+        # own orphan check before the row below is inserted, then delete the
+        # shared blob after the fork completes, 404-ing the fork's attachment.
+        # Forking a session while deleting its attachments is unlikely enough
+        # that we accept it rather than add cross-operation locking or
+        # deferred blob GC; the copy-bytes alternative is the fallback if it
+        # ever proves to matter.
+        if file_store is not None and artifact_store is not None:
+            for stored_file in fork_source_files:
+                copied_file_id = fork_file_id_map[stored_file.id]
+                try:
+                    await asyncio.to_thread(
+                        file_store.create,
+                        filename=stored_file.filename,
+                        bytes=stored_file.bytes,
+                        content_type=stored_file.content_type,
+                        session_id=new_conv.id,
+                        file_id=copied_file_id,
+                        blob_key=stored_file.blob_key or stored_file.id,
+                        source_metadata=stored_file.source_metadata,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "failed to create fork file row %s in fork %s of session %s",
+                        copied_file_id,
+                        new_conv.id,
+                        source_id,
+                        exc_info=True,
+                    )
 
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,
         # unconfigured provider) must not leave the just-forked session
         # unowned and thus invisible to the caller.
-        if permission_store is not None and user_id is not None:
+        if permission_store is not None and user_id is not None and not continue_source:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
-        # Push the forked session to this user's other open tabs.
-        _announce_session_added(user_id, new_conv.id)
-
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
-        # Managed host: schedule the fork's own BACKGROUND sandbox provision
-        # and return immediately, exactly like a managed create. The host is
-        # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace inherits
-        # ALL of the repositories the source recorded (read off the SOURCE,
-        # since a fork never inherits the labels itself), so cloning a
-        # multi-repo sandbox session lands the fork with every repo.
-        if body.host_type == "managed":
-            fork_workspaces = (
-                ([body.workspace] if body.workspace is not None else [])
-                if workspace_set
-                else read_managed_repo_workspaces(source.labels)
-            )
-            await _schedule_managed_launch(
-                request,
-                session_id=new_conv.id,
-                # The fork's own session-scoped agent clone. Deliberately not
-                # the built-in it derives from: only a genuine built-in may
-                # classify a managed runner, and a clone must not inherit that.
-                agent_id=new_conv.agent_id,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=fork_workspaces,
+        # Provision in the background with the caller's credentials. Use explicit
+        # workspaces, else workspace, else every repository recorded on the source.
+        try:
+            if body.host_type == "managed":
+                if "workspaces" in fields_set:
+                    fork_workspaces = list(body.workspaces or [])
+                elif workspace_set:
+                    fork_workspaces = [body.workspace] if body.workspace is not None else []
+                else:
+                    fork_workspaces = read_managed_repo_workspaces(source.labels)
+                await _schedule_managed_launch(
+                    request,
+                    session_id=new_conv.id,
+                    agent_id=new_conv.agent_id,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=fork_workspaces,
+                    requested_host_id=body.host_id,
+                )
+        finally:
+            # Push the forked session to this user's other open tabs — but NOT a
+            # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
+            # row, so announcing it would leak it into every open sidebar (the
+            # real-time path bypasses the list-endpoint's side-chat filter).
+            # Pushed once its managed labels are written, as on a create.
+            # A continuation is announced once placed, with the source's sharing.
+            if not body.side_chat and not continue_source:
+                _announce_session_added(user_id, new_conv.id)
+        # Default-public grant only after the managed launch was accepted (see
+        # the create paths). A side chat is a private scratch fork of the
+        # caller's own view; a continuation takes its source's sharing instead.
+        if user_id is not None and not body.side_chat and not continue_source:
+            await _grant_default_public(
+                request.app.state,
+                permission_store,
+                new_conv.id,
+                managed=body.host_type == "managed",
+                workspace=new_conv.workspace,
+                host_id=new_conv.host_id,
             )
 
         # Bound the response like the GET-session snapshot: newest item page,
@@ -3003,6 +4919,9 @@ def register_core_routes(
         # transcript via the paged items endpoint, so returning the whole
         # copied history only made the user-blocked response scale with
         # source size.
+        if continue_source:
+            # The continuation reads only the new session's metadata.
+            return _build_session_response(new_conv, [], "idle", agent_name=base_agent.name)
         fork_items = await asyncio.to_thread(
             conversation_store.list_items,
             new_conv.id,
@@ -3010,7 +4929,7 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        response = _build_session_response(
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
@@ -3018,234 +4937,360 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+        response.side_chat_allowed = await side_chat_allowed(user_id, new_conv.id, new_conv)
+        return response
 
-    # ── POST /sessions/{session_id}/switch-agent ─────────────────
+    # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
+    # Placeholder: in-place agent switching was retired and will return with a
+    # new request shape in a future release, so the path stays reserved.
+    @router.post("/sessions/{session_id}/switch-agent", include_in_schema=False)
+    async def switch_session_agent(session_id: str) -> None:
+        """Always 410: switching a session's agent in place is not available."""
+        del session_id
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Switching a session's agent in place is not available. "
+                "Fork the session into another agent instead."
+            ),
+        )
 
-    @router.post(
-        "/sessions/{session_id}/switch-agent",
-        # response_model=None keeps FastAPI from re-validating/serializing
-        # the handler's SessionResponse; responses= still advertises the
-        # body schema to docs/SDK tooling.
-        response_model=None,
-        responses={200: {"model": SessionResponse}},
-    )
-    async def switch_session_agent(
+    # ── Continuing a session's work in another session ──────────
+
+    # Moves into a continuation still running after their request was cancelled.
+    _continuation_tasks: set[asyncio.Task[str]] = set()
+
+    def _forget_continuation(done: asyncio.Task[str]) -> None:
+        """Drop a finished move; its failure was reported to a waiting request."""
+        _continuation_tasks.discard(done)
+        if not done.cancelled():
+            done.exception()  # Retrieved, so an abandoned request's failure is not re-logged.
+
+    async def _continue_session_in_fork(
         request: Request,
-        session_id: str,
-        body: SessionSwitchAgentRequest,
-        background_tasks: BackgroundTasks,
-    ) -> SessionResponse:
+        source: Conversation,
+        *,
+        before_item_id: str | None,
+        command: str,
+        title: str,
+        notice: Callable[[str], str],
+        reason: SupersessionReason,
+        prepare: Callable[[], Awaitable[None]] | None = None,
+        copy_history: bool = True,
+    ) -> str:
         """
-        Switch an existing session in place to a different agent/harness.
+        Continue *source* in a fork on the same placement, superseding it.
 
-        Unlike fork, this keeps the SAME session — transcript, comments,
-        files, host, and workspace are untouched; only the agent/harness
-        changes. The current session-scoped agent is replaced by a clone
-        of the target built-in, model settings carry over only within the
-        same provider family (a model id is provider-bound), the native
-        runtime session id is cleared, and the harness-presentation labels
-        are recomputed for the target. The next turn cold-starts the new
-        harness (rebuilding the native transcript from this session's own
-        items for a same-family native target). Only built-in agents are
-        bindable, and only while the session is idle.
+        The fork keeps the source's agent, labels (managed-sandbox ones
+        included) and run settings and only the history before
+        *before_item_id*. It is bound to the source's host and workspace and
+        to its live runner, and the source gets a notice linking to it plus a
+        ``session.superseded`` redirect for live viewers. A fork that cannot
+        be placed is deleted again. Messages to *source* are refused until
+        the redirect is published.
 
-        :param request: The incoming FastAPI request (for auth).
-        :param session_id: Session/conversation identifier to switch,
-            e.g. ``"conv_abc123"``.
-        :param body: The validated :class:`SessionSwitchAgentRequest`.
-        :returns: A :class:`SessionResponse` describing the session after
-            the switch (status ``"idle"``).
-        :raises OmnigentError: 404 if the session or target agent does
-            not exist or the target is not a bindable built-in; 403 if the
-            caller lacks edit access; 400 if the session is a sub-agent,
-            has no agent binding, or the target bundle can't be loaded;
-            409 if a turn is currently running.
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session to supersede.
+        :param before_item_id: First item the fork drops, e.g. ``"msg_abc"``;
+            ``None`` keeps the whole history.
+        :param command: The slash command being run, e.g. ``"/clear"``, for errors.
+        :param title: The fork's title; ``""`` lets its first message name it.
+        :param notice: Builds the source's notice from the fork's id.
+        :param reason: ``session.superseded`` reason, e.g. ``"clear"``.
+        :param prepare: Runs once the request is known to be allowed, before
+            the fork exists, e.g. to free the source's live client.
+        :param copy_history: ``False`` starts the fork empty, with none of the
+            source's items or files; *before_item_id* must then be ``None``.
+        :returns: The fork's session id.
+        :raises OmnigentError: When the caller does not own *source*, it is a
+            sub-agent, a side chat or running a turn, or no runner or host can take the fork;
+            ``WRONG_REPLICA`` when its runner is live on another replica.
         """
         user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        await _require_access_and_level(
+            user_id, source.id, LEVEL_OWNER, permission_store, conversation_store
         )
-        session = access.conversation
-        if session is None:
-            session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if session is None:
-                raise OmnigentError(
-                    f"Session not found: {session_id!r}",
-                    code=ErrorCode.NOT_FOUND,
-                )
-        if session.kind == "sub_agent":
+        if source.kind == "sub_agent":
             raise OmnigentError(
-                "Cannot switch the agent of a sub-agent session — only top-level "
-                "sessions can switch agent.",
+                f"{command} is only available in a top-level session.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if session.agent_id is None:
+        # A side chat rides its source's runner with no host of its own, so a
+        # fork (which drops the side-chat labels) would have no placement.
+        if source.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
             raise OmnigentError(
-                "Session has no agent binding — cannot switch agent.",
+                f"{command} isn't available in a side chat.",
                 code=ErrorCode.INVALID_INPUT,
             )
-
-        # Switching mid-turn would tear the running harness subprocess out
-        # from under an active stream. Reject; the caller retries when idle.
-        if _session_status_from_cache(session_id) == "running":
+        if _session_is_moving(source.id):
             raise OmnigentError(
-                "Session is busy — wait for the current turn to finish before switching agent.",
+                f"This chat is already moving to a new session; wait before running {command}.",
                 code=ErrorCode.CONFLICT,
             )
-
-        current_agent = await asyncio.to_thread(agent_store.get, session.agent_id)
-        if current_agent is None:
+        # An input still reaching its runner counts as a running turn, whatever
+        # status the session shows (a failed one can be recovering).
+        status = _session_status_from_cache(source.id, source.live_status)
+        if status == "running" or _session_is_starting(source.id):
             raise OmnigentError(
-                f"Current agent not found: {session.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
-
-        # Only built-in agents (``session_id IS NULL``) are bindable: a
-        # session-scoped agent belongs to one conversation (possibly another
-        # user's) and must never be cloned across sessions.
-        target_agent = await asyncio.to_thread(agent_store.get, body.agent_id)
-        if target_agent is None or target_agent.session_id is not None:
-            raise OmnigentError(
-                f"Agent not found or not bindable: {body.agent_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            )
-
-        # Reject a no-op switch to the built-in the session is already running:
-        # its session-scoped clone shares the built-in's ``bundle_location``, so
-        # switching would delete + re-clone the same agent and tear the terminal
-        # down for nothing. The contract is that the target differs from the
-        # current agent; the picker already hides the current one, so this only
-        # guards a direct API call.
-        if target_agent.bundle_location == current_agent.bundle_location:
-            raise OmnigentError(
-                "Session is already running this agent — pick a different one.",
+                f"Stop the current turn before running {command}.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        # Held, with no await since the checks above, until viewers are
+        # redirected: messages arriving meanwhile are refused, not run here.
+        moving = contextlib.ExitStack()
+        moving.enter_context(_mark_session_moving(source.id))
 
-        # Load the target bundle BEFORE committing so an unloadable spec fails
-        # the request with zero mutation — the irreversible part of the switch
-        # (deleting the old agent) must not run for a target that can't start.
-        try:
-            from omnigent.server.routes import sessions as _sessions_facade
+        async def move() -> str:
+            with moving:
+                from omnigent.server.routes.sessions.routes_events import (
+                    _raise_if_runner_on_another_replica,
+                )
 
-            await asyncio.to_thread(
-                _sessions_facade.get_agent_cache().load,
-                target_agent.id,
-                target_agent.bundle_location,
-            )
-        except Exception as exc:
-            # Surface any bundle-load failure as a 400 before mutating state.
-            raise OmnigentError(
-                f"Target agent bundle could not be loaded: {body.agent_id!r}",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
+                # A saved startup input still to be delivered is a turn waiting to
+                # start. Checked once moving, so no new one can be saved meanwhile.
+                startup = getattr(request.app.state, "startup_inputs", None)
+                if startup is not None and await startup.has_undelivered(source.id):
+                    raise OmnigentError(
+                        f"Wait for this session's first message to start before running {command}.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                runner_online = (
+                    source.runner_id is not None
+                    and runner_router is not None
+                    and runner_router.runner_is_online(source.runner_id)
+                )
+                if not runner_online and source.runner_id is not None:
+                    # A runner live on another replica is not offline: re-address there
+                    # rather than continue without it.
+                    await _raise_if_runner_on_another_replica(
+                        source, request.app.state, conversation_store
+                    )
+                host_bound = source.host_id is not None and source.workspace is not None
+                runner_offline = OmnigentError(
+                    f"Can't run {command} while this session's runner is offline. "
+                    "Reconnect the session (send a message to wake it), then try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+                if not runner_online and not host_bound:
+                    raise runner_offline
+                fork_request = SessionForkRequest(title=title)
+                fork_options: dict[str, Any] = {
+                    "before_item_id": before_item_id,
+                    "keep_sandbox_labels": True,
+                    "copy_history": copy_history,
+                    "continue_source": True,
+                }
+                if prepare is not None:
+                    # Refuse before the source's live client is freed, so a clear
+                    # that can't continue leaves it untouched.
+                    await _fork_session(
+                        request, source.id, fork_request, validate_only=True, **fork_options
+                    )
+                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                if host_bound and profile_catalog is not None:
+                    await asyncio.to_thread(
+                        profile_catalog.require_session_host,
+                        source.id,
+                        source.host_id,
+                        bind=False,
+                    )
+                if prepare is not None:
+                    await prepare()
 
-        # A model id is provider-bound, so model_override / reasoning_effort
-        # carry over only within the same provider family. A native target
-        # carries history regardless of family: the switch clears
-        # external_session_id and drops the fork-source directive, so the
-        # runner rebuilds the native transcript from this session's own
-        # Omnigent items (a format-agnostic conversion). SDK targets replay
-        # the AP transcript as context regardless.
-        copy_model_settings = await asyncio.to_thread(
-            _same_provider_family, current_agent, target_agent
+                # Chosen up front so a failure anywhere after the fork is
+                # written, inside the fork call included, can remove it by id.
+                fork_id = generate_conversation_id()
+                runner_bound = runner_online
+                runner_initialized = False
+                # Set once the fork is sent to the runner, which may set it up
+                # (or still be doing so) even when the bind then fails.
+                runner_dispatched = False
+                try:
+                    fork = await _fork_session(
+                        request, source.id, fork_request, fork_id=fork_id, **fork_options
+                    )
+                    assert fork is not None
+                    # The same conversation continues there, and every live viewer
+                    # of the source is redirected to it, so it shares exactly as
+                    # the source does (no creation default was applied).
+                    await _copy_session_grants(source.id, fork.id)
+                    # Created with no grants of its own, the fork is the caller's
+                    # only through the copy: a source deleted meanwhile had none.
+                    try:
+                        await _require_access_and_level(
+                            user_id, fork.id, LEVEL_OWNER, permission_store, conversation_store
+                        )
+                    except OmnigentError as exc:
+                        raise OmnigentError(
+                            f"This session was deleted or changed hands during {command}.",
+                            code=ErrorCode.CONFLICT,
+                        ) from exc
+                    if host_bound:
+                        assert source.host_id is not None
+                        # The fork was born on the host under its row lock, so a
+                        # delete of the source from here on keeps it; a host torn
+                        # down first was not copied and leaves the fork unplaced.
+                        if fork.host_id != source.host_id:
+                            raise OmnigentError(
+                                f"This session's host went away during {command}; try again.",
+                                code=ErrorCode.CONFLICT,
+                            )
+                        if profile_catalog is not None:
+                            # Adopt and reauthorize the sandbox's accepted profile
+                            # now, so the fork can wake it even with no runner.
+                            await asyncio.to_thread(
+                                profile_catalog.require_session_host, fork.id, source.host_id
+                            )
+                    if runner_online:
+                        assert source.runner_id is not None and runner_router is not None
+                        runner_dispatched = True
+                        try:
+                            await _update_session(
+                                request,
+                                fork.id,
+                                UpdateSessionRequest(runner_id=source.runner_id),
+                                include_usage=False,
+                            )
+                        except Exception:
+                            if runner_router.runner_is_online(source.runner_id):
+                                raise
+                            runner_bound = False
+                        else:
+                            runner_initialized = True
+                            # The bind tolerates a runner gone before its client
+                            # lookup, so confirm the placement it reports.
+                            runner_bound = runner_router.runner_is_online(source.runner_id)
+                        if not runner_bound:
+                            # The runner left after the check. One now on another
+                            # replica is re-addressed; a host-bound fork otherwise
+                            # relaunches on its host, as with an offline runner.
+                            await _raise_if_runner_on_another_replica(
+                                source, request.app.state, conversation_store
+                            )
+                            if not host_bound:
+                                raise runner_offline
+                            if runner_initialized:
+                                # Drop the binding to the vanished runner, so the
+                                # fork relaunches on its host like an offline one.
+                                await asyncio.to_thread(
+                                    conversation_store.clear_runner_id, fork.id
+                                )
+                    if runner_bound and host_bound:
+                        # As native /clear does: the fork now holds the runner, so
+                        # stopping or archiving the source must not stop it. The
+                        # source keeps its host and resumes on a relaunched runner.
+                        try:
+                            await _update_session(
+                                request,
+                                source.id,
+                                UpdateSessionRequest(runner_id=""),
+                                include_usage=False,
+                            )
+                        except OmnigentError as exc:
+                            # A source deleted meanwhile has nothing left to detach.
+                            if exc.code != ErrorCode.NOT_FOUND:
+                                raise
+                except Exception:
+                    # Leave no fork for a retry to duplicate, nor its runner session.
+                    if runner_dispatched:
+                        await _release_unreturned_runner_session(
+                            fork_id, dataclasses.replace(source, id=fork_id)
+                        )
+                    agent_copy = await _unreturned_fork_agent_copy(fork_id, source.agent_id)
+                    await _delete_unreturned_session(fork_id)
+                    if agent_copy is not None:
+                        await _delete_unreturned_agent_copy(
+                            fork_id, agent_copy.id, agent_copy.bundle_location
+                        )
+                    await _release_unreturned_fork_host(
+                        request, source.host_id if host_bound else None
+                    )
+                    raise
+                # Placed and shared as the source is: now the owner's tabs list it.
+                _announce_session_added(user_id, fork.id)
+
+                # Best-effort, as for native supersession: the fork already holds the
+                # work, so a lost notice must not strand it unreturned.
+                try:
+                    await _persist_external_conversation_item(
+                        source.id,
+                        source,
+                        SessionEventInput(
+                            type=_EXTERNAL_CONVERSATION_ITEM_TYPE,
+                            data={
+                                "item_type": "message",
+                                "item_data": {
+                                    "role": "assistant",
+                                    "agent": fork.agent_name or "assistant",
+                                    "content": [{"type": "output_text", "text": notice(fork.id)}],
+                                },
+                            },
+                        ),
+                        conversation_store,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "Failed to persist the %s supersession notice; old_session=%s new_session=%s",
+                        command,
+                        source.id,
+                        fork.id,
+                        exc_info=True,
+                        extra={"session_id": source.id},
+                    )
+                _publish_session_superseded(source.id, fork.id, reason=reason)
+                _logger.info(
+                    "Session superseded by %s",
+                    command,
+                    extra=debug_event(
+                        "session_superseded",
+                        session_id=source.id,
+                        target_session_id=fork.id,
+                        command=command,
+                        runner_bound=runner_bound,
+                    ),
+                )
+                return fork.id
+
+        # Shielded: once allowed, the move runs to its end (placed, or rolled
+        # back) even if the request is cancelled, e.g. by a client disconnect,
+        # so a cancellation never strands a half-made successor; meanwhile the
+        # move guard refuses a retry.
+        task = asyncio.create_task(move(), name=f"continue-{source.id}")
+        _continuation_tasks.add(task)
+        task.add_done_callback(_forget_continuation)
+        return await asyncio.shield(task)
+
+    async def clear_session_into_fresh_session(
+        request: Request,
+        source: Conversation,
+        release_source: Callable[[], Awaitable[None]],
+    ) -> str:
+        """
+        Continue *source* in a fresh session on the same placement.
+
+        Used for claude-sdk ``/clear``: the SDK replays the Omnigent
+        transcript whenever its client restarts, so clearing in place would
+        bring the old context back.
+
+        :param request: The incoming request, whose caller must own *source*.
+        :param source: Session being cleared.
+        :param release_source: Frees the source's live client; runs only once
+            the clear is allowed.
+        :returns: The new session's id.
+        """
+        return await _continue_session_in_fork(
+            request,
+            source,
+            before_item_id=None,
+            command="/clear",
+            # Untitled, so the first message names it like any new chat.
+            title="",
+            notice=supersession_notice_text,
+            reason="clear",
+            prepare=release_source,
+            # Decided as the fork commits, so items a concurrent write adds
+            # meanwhile stay behind too.
+            copy_history=False,
         )
-        # claude/codex/pi native can replay fork history (each rebuilds its
-        # resumable session file from the copied items); cursor-native can't
-        # (no resumable session file), so don't stamp a carry-history promise
-        # it would silently break with a fresh launch.
-        carry_history_into_native = await asyncio.to_thread(
-            _agent_carries_native_fork_history, target_agent
-        )
-        presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, target_agent)
 
-        # Resolve the built-in the session is leaving so the UI can offer a
-        # one-click "Switch back". The current agent is a session-scoped clone
-        # whose bundle_location was copied verbatim from its source built-in,
-        # so match on that. Page through the full template-agent list (not a
-        # single bounded scan) so the match isn't missed when there are many
-        # built-ins. Best-effort: None when no built-in matches (e.g. its
-        # source built-in was removed) → no switch-back offered.
-        previous_builtin_id: str | None = None
-        _after: str | None = None
-        while True:
-            _page = await asyncio.to_thread(agent_store.list, 100, _after)
-            previous_builtin_id = next(
-                (a.id for a in _page.data if a.bundle_location == current_agent.bundle_location),
-                None,
-            )
-            if previous_builtin_id is not None or not _page.has_more or not _page.data:
-                break
-            _after = _page.last_id
-
-        cloned_agent_id = generate_agent_id()
-        cloned_agent_name = f"{target_agent.name} (switch {cloned_agent_id[:10]})"
-        try:
-            updated = await asyncio.to_thread(
-                conversation_store.switch_conversation_agent,
-                session_id,
-                new_agent_id=cloned_agent_id,
-                new_agent_name=cloned_agent_name,
-                new_agent_bundle_location=target_agent.bundle_location,
-                new_agent_description=target_agent.description,
-                copy_model_settings=copy_model_settings,
-                carry_history_into_native=carry_history_into_native,
-                presentation_labels=presentation_labels,
-                previous_builtin_id=previous_builtin_id,
-            )
-        except LookupError as exc:
-            raise OmnigentError(
-                f"Session not found: {session_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            ) from exc
-
-        # The catalog cache is keyed by session, not harness family, and
-        # outlives runner death — after a switch its rows may belong to the
-        # old wrapper. Drop them (and any in-flight fetch against the old
-        # endpoint) so the next live snapshot re-fetches the new family's.
-        _invalidate_runner_backed_snapshot_state(
-            session_id, cancel_inflight=True, drop_model_options=True
-        )
-
-        # Tell every connected client the binding changed so they re-derive
-        # session state (presentation labels, bound agent) from a fresh
-        # snapshot. Without this, a client that bound before the switch keeps
-        # treating the session as the OLD harness — e.g. its status handler
-        # clears the optimistic first-message bubble that a native target
-        # only reconciles later via session.input.consumed.
-        switch_event = SessionAgentChangedEvent(
-            type="session.agent_changed",
-            conversation_id=session_id,
-            agent_id=cloned_agent_id,
-            # Clean target name, not the clone row's "<name> (switch ag_…)":
-            # the suffix only disambiguates agent rows; clients render
-            # agent_name verbatim (same choice as the session snapshot).
-            agent_name=target_agent.name,
-        )
-        # Access session_stream through the facade so monkeypatches on
-        # sessions.session_stream are honored (the facade's global dict is
-        # the patch target; this closure's globals are routes_core's dict).
-        from omnigent.server.routes import sessions as _sessions_facade
-
-        _sessions_facade.session_stream.publish(session_id, switch_event.model_dump())
-
-        # Reset the OLD harness's runner-side resources (async, after the
-        # response): close the cached primary OSEnv so the new agent's
-        # os_env/sandbox governs the web filesystem/shell endpoints, and tear
-        # down the native terminal so it can't shadow the switch-back transcript
-        # rebuild. Safe because the switch only runs while the session is idle
-        # (doing it mid-turn would wedge the turn); the next access
-        # re-materializes from the new agent's spec, preserving the workspace /
-        # worktree (cwd comes from the runner workspace).
-        background_tasks.add_task(_reset_runner_resources_after_switch, session_id)
-
-        items = await asyncio.to_thread(conversation_store.list_items, session_id, limit=10000)
-        level = await _get_permission_level(user_id, session_id, permission_store)
-        return _build_session_response(
-            updated,
-            items.data,
-            "idle",
-            permission_level=level,
-            last_task_error=None,
-            agent_name=target_agent.name,
-        )
+    return clear_session_into_fresh_session

@@ -179,7 +179,7 @@ def load(
         is a tarball or bytes, ignored when *source* is a directory
         or omnigent YAML.
     :param expand_env: Whether to expand ``${VAR}`` references in
-        connection blocks, MCP headers, and MCP ``env`` against the
+        executor auth, connection blocks, MCP headers, and MCP ``env`` against the
         current process environment. ``True`` (the default) is for
         operator-authored specs whose author is the process owner
         (local ``omnigent run``, ``--agent`` preregistration). It
@@ -245,6 +245,7 @@ def load(
         if is_omnigent_yaml(source):
             return load_omnigent_yaml(
                 source,
+                expand_env=expand_env,
                 enforce_handler_allowlist=enforce_handler_allowlist,
                 prune_invalid_sub_agents=prune_invalid_sub_agents,
             )
@@ -278,14 +279,13 @@ def load(
     # YAML into a single-file tarball for the agent store. See
     # omnigent/spec/_omnigent_compat.py for the tech-debt
     # ownership; remove when omnigent compat ends.
-    # The omnigent single-file path (load_omnigent_yaml) copies
-    # headers / connection verbatim and never expands ``${VAR}``
-    # against the process env, so it is safe regardless of
-    # *expand_env* and the flag does not apply.
+    # The single-file path must honor *expand_env* for executor auth as
+    # well as the native config.yaml parser does.
     candidate = _find_omnigent_yaml_in_dir(root)
     if candidate is not None:
         return load_omnigent_yaml(
             candidate,
+            expand_env=expand_env,
             enforce_handler_allowlist=enforce_handler_allowlist,
             prune_invalid_sub_agents=prune_invalid_sub_agents,
         )
@@ -366,23 +366,12 @@ def _prune_invalid_sub_agents(spec: AgentSpec) -> list[str]:
 
 
 def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
-    """Reject function policies whose handler is not registered.
+    """Validate policy handlers throughout a parsed uploaded agent tree.
 
-    Scans a parsed :class:`AgentSpec`'s guardrail policies for
-    :class:`~omnigent.spec.types.FunctionPolicySpec` entries whose
-    ``function.path`` is not in the policy registry. Recurses into
-    ``sub_agents`` — the ``config.yaml`` parser discovers child agents
-    from ``agents/`` subdirectories, each with its own ``guardrails``,
-    and those handlers are resolved + called at engine build just like
-    the root's, so a clean root with a malicious sub-agent would
-    otherwise bypass the upload allowlist. Used on the untrusted
-    agent-bundle upload path only (see :func:`load`).
-
-    :param spec: The parsed agent spec (or sub-agent) to scan.
-    :raises OmnigentError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Both bundle formats use the same registry check, including legacy wrappers
+    and policies belonging to nested agents.
     """
-    from omnigent.policies.registry import is_registered_handler
+    from omnigent.policies.registry import function_policy_handler_allowed
 
     guardrails = spec.guardrails
     if guardrails is not None:
@@ -390,7 +379,9 @@ def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
             if (
                 isinstance(policy, FunctionPolicySpec)
                 and policy.function is not None
-                and not is_registered_handler(policy.function.path)
+                and not function_policy_handler_allowed(
+                    policy.function.path, policy.function.arguments
+                )
             ):
                 raise OmnigentError(
                     f"Policy {policy.name!r}: handler {policy.function.path!r} is not a "

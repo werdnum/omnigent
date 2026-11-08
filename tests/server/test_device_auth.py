@@ -254,7 +254,11 @@ def test_revoke_is_fail_closed(store: DeviceGrantStore) -> None:
 
 
 def _build_accounts_app(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, device_grant_enabled: bool = True
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device_grant_enabled: bool = True,
+    base_path: str | None = None,
 ) -> Iterator[TestClient]:
     monkeypatch.delenv("OMNIGENT_OIDC_ISSUER", raising=False)
     monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "accounts")
@@ -319,6 +323,7 @@ def _build_accounts_app(
         host_store=host_store,
         auth_provider=auth_provider,
         account_store=account_store,
+        base_path=base_path,
     )
     with TestClient(app) as client:
         yield client
@@ -426,6 +431,70 @@ def test_consent_page_requires_login(app: TestClient) -> None:
     r = app.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
     assert r.status_code == 302
     assert "/login" in r.headers["location"]
+
+
+def test_consent_page_login_bounce_carries_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a configured base path, the login bounce and its return_to are prefixed.
+
+    Otherwise the browser is sent to the bare domain root's /login, which a
+    subpath reverse proxy (e.g. code-server's /proxy/<port>/) has no route
+    for — the device-authorization consent flow would break under exactly
+    the deployment OMNIGENT_WEB_BASE_PATH exists to support.
+    """
+    gen = _build_accounts_app(tmp_path, monkeypatch, base_path="/proxy/6767")
+    client = next(gen)
+    try:
+        r = client.get("/oauth/device?user_code=ABCD-2345", follow_redirects=False)
+        assert r.status_code == 302
+        location = r.headers["location"]
+        assert location.startswith("/proxy/6767/login")
+        assert "return_to=/proxy/6767/oauth/device" in location
+    finally:
+        gen.close()
+
+
+def test_device_authorize_verification_uri_carries_base_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under a base path, the advertised verification_uri stays under the mount.
+
+    A subpath-only proxy has no route for the bare-origin /oauth/device, so a
+    verification_uri that omitted the prefix would leave the device flow with
+    no reachable consent page.
+    """
+    gen = _build_accounts_app(tmp_path, monkeypatch, base_path="/proxy/6767")
+    client = next(gen)
+    try:
+        r = client.post("/oauth/device/authorize", json={"client_id": "slack"})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["verification_uri"].endswith("/proxy/6767/oauth/device")
+        assert "/proxy/6767/oauth/device?user_code=" in data["verification_uri_complete"]
+    finally:
+        gen.close()
+
+
+def test_consent_html_prefixes_form_actions_under_base_path() -> None:
+    """The consent page's form actions carry the base path so the POST/GET
+    reaches the app behind a stripping proxy (the page is not run through the
+    SPA rewrite); at the origin root they are unprefixed (unchanged)."""
+    from omnigent.server.routes.device_auth import _consent_html
+
+    prompt = _consent_html(prompt_for_code=True, base_path="/proxy/6767")
+    assert 'action="/proxy/6767/oauth/device"' in prompt
+
+    authorize = _consent_html(
+        user_code="ABCD-1234", user_id="u@example.com", base_path="/proxy/6767"
+    )
+    assert 'action="/proxy/6767/oauth/device/approve"' in authorize
+    assert 'action="/proxy/6767/oauth/device/deny"' in authorize
+
+    root = _consent_html(user_code="ABCD-1234", user_id="u@example.com")
+    assert 'action="/oauth/device/approve"' in root
+    assert 'action="/oauth/device/deny"' in root
+    assert "/proxy" not in root
 
 
 def test_unsupported_grant_type(app: TestClient) -> None:
@@ -732,11 +801,27 @@ def test_device_authorize_refuses_reserved_login_client_id(app: TestClient) -> N
     assert "device_code" not in r.text
 
 
+def _exchange_device_code(client: TestClient, device_code: str):
+    """Exchange an approved *device_code*, waiting out the server's poll interval."""
+    import time
+
+    for _ in range(4):
+        response = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+            },
+        )
+        if response.json().get("error") != "slow_down":
+            break
+        time.sleep(1.2)
+    return response
+
+
 def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     """Third-party device grants keep the delegated scope AND keep rotating —
     the login-grant carve-out must not leak to them."""
-    import time as _time
-
     r = app.post("/oauth/device/authorize", json={"client_id": "slack"})
     data = r.json()
     _login_admin(app)
@@ -745,17 +830,7 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
         data={"user_code": data["user_code"]},
         headers={"Origin": "http://localhost:8000"},
     )
-    for _ in range(4):
-        r = app.post(
-            "/oauth/token",
-            data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "device_code": data["device_code"],
-            },
-        )
-        if r.status_code == 200:
-            break
-        _time.sleep(1.2)
+    r = _exchange_device_code(app, data["device_code"])
     assert r.status_code == 200, r.text
     body = r.json()
     claims = jwt.decode(body["access_token"], options={"verify_signature": False})
@@ -768,6 +843,27 @@ def test_device_grant_refresh_stays_scope_restricted(app: TestClient) -> None:
     )
     assert r2.status_code == 200, r2.text
     assert r2.json()["refresh_token"] != body["refresh_token"]
+
+
+def test_device_code_approved_before_password_change_is_refused(app: TestClient) -> None:
+    """A grant approved before the approver changes their password cannot be
+    exchanged afterwards, even though the device code itself is still valid."""
+    data = app.post("/oauth/device/authorize", json={"client_id": "slack"}).json()
+    _login_admin(app)
+    r = app.post(
+        "/oauth/device/approve",
+        data={"user_code": data["user_code"]},
+        headers={"Origin": "http://localhost:8000"},
+    )
+    assert r.status_code == 200 and "Connected" in r.text
+    r = app.post(
+        "/auth/users/me/password",
+        json={"old_password": "admin-pw-12345", "new_password": "admin-new-pw-12345"},
+    )
+    assert r.status_code == 204, r.text
+    r = _exchange_device_code(app, data["device_code"])
+    assert r.status_code == 400 and r.json()["error"] == "invalid_grant", r.text
+    assert "access_token" not in r.json()
 
 
 def test_web_login_never_issues_refresh(disabled_app: TestClient) -> None:

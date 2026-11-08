@@ -656,7 +656,7 @@ def test_list_conversations_user_with_direct_grant_sees_session(
 ) -> None:
     """A user with a direct grant sees their session via ``list_conversations(accessible_by=...)``.
 
-    The UNION filter in list_conversations must include sessions where the
+    The ACL filter in list_conversations must include sessions where the
     user has a direct permission row.
     """
     _ensure_user(store, "alice@test.com")
@@ -683,7 +683,7 @@ def test_list_conversations_user_with_no_grants_sees_nothing(
 ) -> None:
     """A user with no grants sees no sessions via ``list_conversations(accessible_by=...)``.
 
-    The UNION filter must exclude sessions where the user has no permission row.
+    The ACL filter must exclude sessions where the user has no permission row.
     """
     _ensure_user(store, "alice@test.com")
     _ensure_user(store, "bob@test.com")
@@ -1111,6 +1111,12 @@ def test_list_for_sessions_returns_grouped_grants(
     assert len(result[conv_a]) == 2
     assert len(result[conv_b]) == 1
     assert result[conv_b][0].user_id == "alice"
+
+    for user_id in {grant.user_id for grants in result.values() for grant in grants}:
+        assert store.list_for_sessions([conv_a, conv_b], user_id=user_id) == {
+            conversation_id: [grant for grant in grants if grant.user_id == user_id]
+            for conversation_id, grants in result.items()
+        }
 
 
 def test_list_for_sessions_empty_input(store: SqlAlchemyPermissionStore) -> None:

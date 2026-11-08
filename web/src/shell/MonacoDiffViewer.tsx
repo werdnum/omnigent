@@ -25,6 +25,9 @@ import {
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import { attachEditorScrollRestore } from "./useScrollRestore";
+import { useMonacoFilePosition } from "./useMonacoFilePosition";
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import type { monaco } from "./monacoSetup";
 import "./monacoCodeEditor.css";
 
@@ -44,6 +47,7 @@ interface FindController extends monaco.editor.IEditorContribution {
 }
 
 interface MonacoDiffViewerProps {
+  position?: FilePosition;
   /** File content before this session (null = new file). */
   before: string | null;
   /** Current file content (null = deleted file). */
@@ -72,10 +76,20 @@ interface MonacoDiffViewerProps {
    */
   searchOpen?: boolean;
   /**
+   * Bumped on every Cmd+F. Re-running Monaco's find action while the widget is
+   * already open refocuses its input, which `searchOpen` alone can't trigger.
+   */
+  searchFocusNonce?: number;
+  /**
    * Called when the find widget is closed from within Monaco (Escape or the
    * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
    */
   onSearchHandled?: () => void;
+}
+
+/** Warm the shared themes and grammar without mounting an editor or starting a diff. */
+export function prepareDiffEditor(lang: ReturnType<typeof detectLang>) {
+  return Promise.all([ensureMonacoReady(), ensureLanguage(lang)]);
 }
 
 /**
@@ -87,6 +101,7 @@ interface MonacoDiffViewerProps {
  * @returns The diff editor surface plus the floating "Add comment" button.
  */
 export function MonacoDiffViewer({
+  position,
   before,
   after,
   path,
@@ -99,6 +114,7 @@ export function MonacoDiffViewer({
   onSetActiveSelection,
   pendingBodyRef,
   searchOpen,
+  searchFocusNonce,
   onSearchHandled,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
@@ -116,7 +132,7 @@ export function MonacoDiffViewer({
     // not-yet-registered grammar/theme — independent of any remount key.
     setReady(false);
     setLoadError(false);
-    void Promise.all([ensureMonacoReady(), ensureLanguage(lang)]).then(
+    void prepareDiffEditor(lang).then(
       () => {
         if (!cancelled) setReady(true);
       },
@@ -139,10 +155,20 @@ export function MonacoDiffViewer({
   const originalModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const modifiedModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const [mounted, setMounted] = useState(false);
+  const cancelScrollRestoreRef = useRef<(() => void) | null>(null);
+  useMonacoFilePosition({
+    editorRef: modifiedEditorRef,
+    mounted,
+    position,
+    cancelScrollRestoreRef,
+    diffEditorRef,
+  });
 
   // The diff scrolls inside Monaco, so its offset is cached per conversation +
   // file rather than via the DOM scroll-restore hook. Kept in its own namespace
   // so a file's diff and its editor view don't share one offset.
+  const positionRef = useRef(position);
+  positionRef.current = position;
   const scrollKeyRef = useRef("");
   scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
 
@@ -165,10 +191,11 @@ export function MonacoDiffViewer({
         );
       // Restore the reader's place in the diff and cache further scrolling under
       // the diff's own key.
-      attachEditorScrollRestore(
+      cancelScrollRestoreRef.current = attachEditorScrollRestore(
         modified,
         () => scrollKeyRef.current,
         () => modifiedEditorRef.current === modified,
+        !isFilePositionPending(positionRef.current),
       );
       setMounted(true);
     },
@@ -206,11 +233,9 @@ export function MonacoDiffViewer({
     [],
   );
 
-  // Mirror the "Find in file" toggle to Monaco's native find widget on the
-  // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
-  // was still loading isn't dropped. `searchOpen` true opens find; false closes
-  // it. The controller drives the close directly so re-toggling is a real close,
-  // not a second open.
+  // Mirror the find toggle to Monaco's find widget on the modified side once
+  // `mounted` (so a Cmd+F during the lazy load isn't dropped): `searchOpen`
+  // opens/closes it via the controller; a bumped `searchFocusNonce` refocuses it.
   useEffect(() => {
     if (!mounted) return;
     const editor = modifiedEditorRef.current;
@@ -221,7 +246,7 @@ export function MonacoDiffViewer({
       const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
       if (controller?.getState().isRevealed) controller.closeFindWidget();
     }
-  }, [mounted, searchOpen]);
+  }, [mounted, searchOpen, searchFocusNonce]);
 
   // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
   // to the owning toggle, so its state matches the visible widget and the next
@@ -276,7 +301,8 @@ export function MonacoDiffViewer({
       // wide enough for split (see SPLIT_DIFF_MIN_WIDTH), so we leave Monaco's
       // responsive default in place rather than forcing split at any width.
       minimap: { enabled: false },
-      scrollBeyondLastLine: false,
+      // Keep centering room even after a plain open so collapsed diffs do not jump.
+      scrollBeyondLastLine: true,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect above. An unset family
       // resolves to the shared mono stack, so the diff matches the terminal

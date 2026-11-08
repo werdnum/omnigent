@@ -1,5 +1,19 @@
-import { cleanup, renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useConversations as useTestConversations,
+  useConversations,
+} from "@/hooks/useConversations";
+
+// `serverRows` follows the displayed rows unless a test sets the server's own counts.
+const serverRowsOverride = vi.hoisted(() => ({ rows: undefined as Conversation[] | undefined }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => {
+    const loaded = useTestConversations();
+    const displayed = loaded.data?.pages.flatMap((page) => page.data) ?? [];
+    return { ...loaded, serverRows: serverRowsOverride.rows ?? displayed };
+  },
+}));
+import { cleanup, renderHook, act } from "@testing-library/react";
 
 const navigateMock = vi.fn();
 // The hook consumes `useNavigate` from the routing IoC seam (@/lib/routing),
@@ -37,7 +51,6 @@ vi.mock("@/lib/lastAssistantText", () => ({
   fetchLastAssistantText: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   getNotificationPermission,
@@ -117,6 +130,7 @@ function setWindowFocused(focused: boolean): void {
 }
 
 beforeEach(() => {
+  serverRowsOverride.rows = undefined;
   // Fake only the timers the settle uses, leaving Date/microtasks/etc. real so
   // React's act scheduling and the preview promise keep working.
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -294,6 +308,21 @@ describe("useIdleNotifications elicitation transitions", () => {
       body: "Agent is asking for your input.",
       tag: "omnigent:session:a",
     });
+  });
+
+  it("does not announce a prompt as new when its answer in flight is rolled back", () => {
+    // The server keeps counting the prompt while the sidebar subtracts the answer.
+    serverRowsOverride.rows = [conv("a", "running", 1)];
+    setConversations([conv("a", "running", 1)]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([conv("a", "running", 0)]);
+    rerender();
+
+    // The POST failed or the hold expired, so the prompt shows again.
+    setConversations([conv("a", "running", 1)]);
+    rerender();
+
+    expect(showMock).not.toHaveBeenCalled();
   });
 
   it("does not notify on a fresh load with already-pending elicitations", () => {
@@ -729,4 +758,17 @@ describe("useIdleNotifications lazy permission request", () => {
     });
     expect(requestPermMock).not.toHaveBeenCalled();
   });
+});
+
+it("cancels a deferred notification when its scope leaves the loaded rows", async () => {
+  setConversations([conv("shared", "running")]);
+  const { rerender } = renderHook(() => useIdleNotifications());
+  setConversations([conv("shared", "idle")]);
+  rerender();
+  setConversations([]);
+  rerender();
+  await settle();
+  expect(showMock).not.toHaveBeenCalled();
+  expect(fetchPreviewMock).not.toHaveBeenCalled();
+  expect(setBadgeMock).toHaveBeenLastCalledWith(0);
 });

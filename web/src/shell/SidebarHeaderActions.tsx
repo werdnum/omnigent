@@ -1,16 +1,28 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
+import {
+  ARIA_MOD_KEY,
+  COMMAND_PALETTE_KEYS,
+  settingsAriaShortcut,
+  settingsShortcutKeys,
+  sidebarToggleAriaShortcut,
+  sidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
- * inside the sidebar (every browser and non-mac platform) and, on the macOS
- * desktop shell, in the persistent title-bar strip. There it must survive the
+ * inside the sidebar (every browser and non-mac platform, and the macOS shell
+ * below md, where the phone drawer owns it) and, on the macOS desktop shell at
+ * md+, in the persistent title-bar strip. There it must survive the
  * sidebar collapsing — the sidebar goes `md:w-0 md:overflow-hidden` and turns
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
@@ -25,6 +37,7 @@ export function SidebarHeaderActions({
   expanded,
   onToggle,
   onOpenSearch,
+  showSearch = true,
   onSettingsClick,
   onTogglePointerEnter,
   onTogglePointerDown,
@@ -39,6 +52,8 @@ export function SidebarHeaderActions({
   onToggle: () => void;
   /** Open the command palette (search). Optional so the cluster can render standalone. */
   onOpenSearch?: () => void;
+  /** Keep Search out when another surface owns it, such as the Electron brand row. */
+  showSearch?: boolean;
   /**
    * Extra handler for the Settings link. The in-sidebar copy passes nothing (on
    * mobile, entering Settings keeps the drawer open and swaps it to the section
@@ -56,7 +71,7 @@ export function SidebarHeaderActions({
 }) {
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-      <SidebarSearchButton onOpenSearch={onOpenSearch} />
+      {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
       <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       <Tooltip>
         <TooltipTrigger asChild>
@@ -65,6 +80,7 @@ export function SidebarHeaderActions({
             variant="ghost"
             size="icon-xs"
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
+            aria-keyshortcuts={sidebarToggleAriaShortcut()}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
             onPointerDown={onTogglePointerDown}
@@ -79,32 +95,25 @@ export function SidebarHeaderActions({
             is open; panel-left-open as "bring it back" once it is collapsed or
             merely peeking. */}
             {expanded ? (
-              <PanelRightOpenIcon className="ui-icon" />
+              <PanelRightOpenIcon className="size-4" />
             ) : (
-              <PanelLeftOpenIcon className="ui-icon" />
+              <PanelLeftOpenIcon className="size-4" />
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          {expanded ? "Collapse sidebar" : "Open sidebar"}
+        <TooltipContent side="bottom" shortcut={sidebarToggleShortcutKeys()}>
+          <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
     </div>
   );
 }
 
-/**
- * Mobile treatment shared by the two floating icon buttons: a thumb-sized round
- * chip in iOS liquid glass. The look lives in one CSS class
- * (`.sidebar-glass-chip` in index.css) that both chips wear, so Search and
- * Settings can't drift apart — they had, one landing opaque with a heavier
- * shadow than the other. On desktop the class is inert (it is scoped to the
- * mobile breakpoint) and these stay flat 24px ghost icons in the header row.
- */
+/** Shared sizing for the mobile icon-only Search and Settings actions. */
 const SIDEBAR_FLOAT_BUTTON =
-  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:text-foreground";
+  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:border-none max-md:p-0 max-md:text-foreground max-md:shadow-none max-md:[--icon-container-default:20px]";
 
-const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[22px]";
+const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 
 /**
  * Search (command palette) icon button.
@@ -120,28 +129,33 @@ const SIDEBAR_FLOAT_ICON = "ui-icon max-md:size-[22px]";
 export function SidebarSearchButton({
   onOpenSearch,
   className,
+  testId = "sidebar-search-button",
 }: {
   onOpenSearch?: () => void;
   className?: string;
+  testId?: string;
 }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button
+        <MobileHeaderButton
           type="button"
           variant="ghost"
           size="icon-xs"
           aria-label="Search"
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+K`}
           onClick={() => onOpenSearch?.()}
           className={cn(SIDEBAR_FLOAT_BUTTON, className)}
-          data-testid="sidebar-search-button"
+          data-testid={testId}
         >
           <SearchIcon className={SIDEBAR_FLOAT_ICON} />
-        </Button>
+        </MobileHeaderButton>
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
-      <TooltipContent side="bottom">Search</TooltipContent>
+      <TooltipContent side="bottom" shortcut={COMMAND_PALETTE_KEYS}>
+        <span>Search</span>
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -164,22 +178,27 @@ export function SidebarSettingsButton({
   /** Distinguishes the header-row copy from the mobile floating copy. */
   testId?: string;
 }) {
+  const isMobile = useIsMobileViewport();
   return (
-    <Tooltip>
+    <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
         <Button
           asChild
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
-          className={cn(SIDEBAR_FLOAT_BUTTON, className)}
+          aria-keyshortcuts={settingsAriaShortcut()}
+          className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
-            <SettingsIcon className={SIDEBAR_FLOAT_ICON} />
+            <SettingsIcon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
+            {isMobile && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom">Settings</TooltipContent>
+      <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
+        <span>Settings</span>
+      </TooltipContent>
     </Tooltip>
   );
 }

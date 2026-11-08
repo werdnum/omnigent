@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import tomllib
 
 from omnigent.host import databricks_credential as dc
 from omnigent.host import jcode_databricks as jd
@@ -52,6 +52,25 @@ def _mock_broker(
     m = Mock(return_value=(workspace, bearer))
     monkeypatch.setattr("omnigent.host.jcode_databricks.fetch_broker_bearer", m)
     return m
+
+
+def test_configured_gateway_persists_only_the_credential_environment_reference() -> None:
+    for token in ("test-initial-gateway-bearer", "test-refreshed-gateway-bearer"):
+        result = jd.configured_jcode_gateway_env(
+            base_url="https://gateway.example/v1",
+            api_key=token,
+            model="private-model",
+            session_id="configured-gateway",
+        )
+        home = Path(result["JCODE_HOME"])
+        config = tomllib.loads((home / "config.toml").read_text())
+        credential_env_var = config["providers"]["omnigent"]["api_key_env"]
+        assert credential_env_var == "OMNIGENT_JCODE_GATEWAY_KEY"
+        assert result[credential_env_var] == token
+        for path in home.rglob("*"):
+            if path.is_file():
+                assert "test-initial-gateway-bearer" not in path.read_text()
+                assert "test-refreshed-gateway-bearer" not in path.read_text()
 
 
 class TestConnectJcodeGatewayEnv:

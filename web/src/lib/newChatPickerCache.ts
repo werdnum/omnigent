@@ -1,3 +1,4 @@
+import { modelOptionSchema } from "./modelCatalogCache";
 import { z } from "zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { readLastAgentId } from "./agentPreferences";
@@ -37,24 +38,7 @@ const pickerAgentSchema = agentSchema.extend({
   skills: z.array(z.object({ name: z.string(), description: z.string() })),
   builtin: z.boolean().optional(),
   acpHarness: z.boolean().optional(),
-});
-const modelOptionSchema = z.object({
-  id: z.string(),
-  model: z.string().optional(),
-  displayName: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  defaultReasoningEffort: z.string().optional(),
-  supportedReasoningEfforts: z
-    .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
-    .optional(),
-  source: z
-    .object({
-      kind: z.string(),
-      label: z.string(),
-      name: z.string().optional(),
-      host: z.string().optional(),
-    })
-    .optional(),
+  mine: z.literal(true).optional(),
 });
 const pickerOptionsSchema = z.object({
   agent: pickerAgentSchema,
@@ -63,10 +47,13 @@ const pickerOptionsSchema = z.object({
   sandboxSelected: z.boolean(),
   model: z.string(),
   models: z.object({
-    claude: z.array(modelOptionSchema),
-    codex: z.array(modelOptionSchema),
-    pi: z.array(modelOptionSchema),
+    claude: z.array(modelOptionSchema).optional(),
+    codex: z.array(modelOptionSchema).optional(),
+    pi: z.array(modelOptionSchema).optional(),
   }),
+});
+const storedPickerOptionsSchema = pickerOptionsSchema.extend({
+  catalogVersion: z.literal(1).optional(),
 });
 
 // Cached menus are editable; live queries still own availability and launch readiness.
@@ -156,18 +143,31 @@ export function writeNewChatPickerCache(
 }
 
 export function readNewChatPickerOptionsCache(key: string | null): NewChatPickerOptions | null {
-  return readPreview(
+  const cached = readPreview(
     key === null ? null : `${key}:options`,
-    pickerOptionsSchema,
+    storedPickerOptionsSchema,
     preferenceSignature,
   );
+  if (cached === null) return null;
+  const { catalogVersion, ...options } = cached;
+  if (catalogVersion === undefined) {
+    // Older caches stored missing catalogs as empty arrays; only populated lists are known.
+    for (const harness of ["claude", "codex", "pi"] as const) {
+      if (options.models[harness]?.length === 0) options.models[harness] = undefined;
+    }
+  }
+  return options;
 }
 
 export function writeNewChatPickerOptionsCache(
   key: string | null,
   options: NewChatPickerOptions | null,
 ): void {
-  writePreview(key === null ? null : `${key}:options`, options, preferenceSignature);
+  writePreview(
+    key === null ? null : `${key}:options`,
+    options === null ? null : { ...options, catalogVersion: 1 },
+    preferenceSignature,
+  );
 }
 
 export function readNewChatPermissionCache(key: string | null): NewChatPermissionPreview | null {

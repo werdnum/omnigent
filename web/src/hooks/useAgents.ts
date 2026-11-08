@@ -1,14 +1,8 @@
-// TanStack Query wrappers for agent information.
-//
-// Agents are now derived from session data rather than a standalone
-// `/api/agents` endpoint. `fetchAgents()` calls `GET /v1/sessions`
-// and extracts unique `{id, name}` pairs from the `agent_id` /
-// `agent_name` fields on each session. `useSessionAgent(sessionId)`
-// fetches the full `AgentObject` for a single session via
-// `GET /v1/sessions/{sessionId}/agent`.
+// Agent discovery and per-session agent information.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { useSessionAgents } from "./useAvailableAgents";
 import { isTempConvId } from "@/lib/tempConversationId";
 
 export interface McpServerSummary {
@@ -52,8 +46,14 @@ export interface Agent {
   harness?: string | null;
   /** MCP server declarations from the agent spec. Empty when none configured. */
   mcp_servers?: McpServerSummary[];
+  /** Whether a claude-sdk session loads the user's Claude settings and user-scope MCP
+   * servers; false when the spec's `skills: none` runs the CLI with no setting sources.
+   * Absent on older servers, which the web reads as true. */
+  loads_user_settings?: boolean;
   /** Whether the active session's agent bundle can be edited through the UI. */
   mcp_servers_editable?: boolean;
+  /** Whether managed MCP services can be selected for the active session. */
+  mcp_registry_editable?: boolean;
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names declared in the spec's `terminals:` block, in
@@ -65,56 +65,9 @@ export interface Agent {
   terminals?: string[];
 }
 
-/** Wire shape of a session list item from `GET /v1/sessions`. */
-interface SessionListItemWire {
-  id: string;
-  agent_id: string;
-  agent_name?: string | null;
-}
-
-interface SessionsListResponse {
-  data: SessionListItemWire[];
-  has_more: boolean;
-}
-
-/**
- * Fetch unique agents by scanning the sessions list.
- *
- * Calls `GET /v1/sessions?limit=100` and deduplicates by `agent_id`.
- * Sessions without an `agent_name` are skipped (orphaned / deleted
- * agent). The returned `Agent` objects carry only `id` and `name` —
- * `description` and `mcp_servers` require a per-session agent fetch
- * via `useSessionAgent`.
- */
-async function fetchAgents(): Promise<Agent[]> {
-  const res = await authenticatedFetch("/v1/sessions?limit=100");
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as SessionsListResponse;
-
-  const seen = new Map<string, Agent>();
-  for (const session of json.data) {
-    if (!session.agent_id || seen.has(session.agent_id)) continue;
-    seen.set(session.agent_id, {
-      id: session.agent_id,
-      name: session.agent_name ?? session.agent_id,
-    });
-  }
-  return Array.from(seen.values());
-}
-
-/**
- * Fetch the agents list, derived from active sessions.
- *
- * Intended for the landing page (no active session); the session
- * detail page uses `useSessionAgent` for the bound agent instead.
- */
+/** Agents discovered in the first 30 cached Mine sessions, shared with the picker. */
 export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
-  return useQuery({
-    queryKey: ["agents"],
-    queryFn: fetchAgents,
-    staleTime: Infinity,
-    enabled,
-  });
+  return useSessionAgents(enabled);
 }
 
 /**
@@ -128,7 +81,9 @@ interface AgentObjectWire {
   description?: string | null;
   harness?: string | null;
   mcp_servers?: McpServerSummary[];
+  loads_user_settings?: boolean;
   mcp_servers_editable?: boolean;
+  mcp_registry_editable?: boolean;
   policies?: PolicySummary[];
   terminals?: string[];
 }
@@ -149,7 +104,9 @@ async function fetchSessionAgent(sessionId: string): Promise<Agent> {
     description: json.description,
     harness: json.harness ?? null,
     mcp_servers: json.mcp_servers,
+    loads_user_settings: json.loads_user_settings,
     mcp_servers_editable: json.mcp_servers_editable,
+    mcp_registry_editable: json.mcp_registry_editable,
     policies: json.policies,
     terminals: json.terminals,
   };
@@ -174,7 +131,7 @@ export function useSessionAgent(sessionId: string | null) {
 
 export interface UpsertMcpServerInput {
   name: string;
-  transport: "http" | "stdio";
+  transport: "http" | "stdio" | "registry";
   description?: string | null;
   url?: string | null;
   headers?: Record<string, string> | null;

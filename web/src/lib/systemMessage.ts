@@ -9,6 +9,45 @@
 import type { MessageContentBlock } from "@/lib/blocks";
 import { isTextBlock } from "@/lib/blocks";
 
+const TEAMMATE_MESSAGE_RE =
+  /^<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>[\s\S]*?<\/teammate-message>/;
+const AGENT_MESSAGE_RE = /^<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>[\s\S]*?<\/agent-message>/;
+const TEAMMATE_MESSAGE_PREFIXES = [
+  "Another Claude session sent a message:\n",
+  "Another Claude session sent a message while you were working:\n",
+  "A peer session sent a message while you were working:\n",
+];
+const TEAMMATE_DELIVERY_GUIDANCE = [
+  "This came from another Claude session — not typed by your user,",
+  'That "other Claude session" is an agent working inside this same session —',
+];
+
+/** Recognize older Claude task/team context that was persisted without is_meta. */
+export function isClaudeAgentMessageContent(content: MessageContentBlock[]): boolean {
+  if (content.some((block) => block.type !== "input_text")) return false;
+  const texts = content.map((block) => ("text" in block ? block.text.trim() : "")).filter(Boolean);
+  return texts.length > 0 && texts.every(isClaudeAgentMessageText);
+}
+
+function isClaudeAgentMessageText(text: string): boolean {
+  if (isClaudeTaskNotificationText(text)) {
+    return /<summary>\s*Agent\b/.test(text) || /<result>[\s\S]*<\/result>/.test(text);
+  }
+  const prefix = TEAMMATE_MESSAGE_PREFIXES.find((candidate) => text.startsWith(candidate));
+  let remaining = prefix ? text.slice(prefix.length).trimStart() : text;
+  let match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  if (!match) return false;
+  while (match) {
+    remaining = remaining.slice(match[0].length).trimStart();
+    if (!remaining) return true;
+    match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  }
+  // Peer wrappers can append native delivery instructions after the envelopes.
+  return Boolean(
+    prefix && TEAMMATE_DELIVERY_GUIDANCE.some((guidance) => remaining.startsWith(guidance)),
+  );
+}
+
 export type SystemMessageKind =
   | "task_completed"
   | "task_failed"
@@ -139,6 +178,11 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
 // must see the same text extraction the bubble render uses.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
+/** `text` without the "[Attached: …]" markers a native executor adds for uploads. */
+export function withoutAttachedMarkers(text: string): string {
+  return text.replace(ATTACHED_RE, "").trim();
+}
+
 /**
  * True when a user-role message is actually a runtime `[System: …]` marker
  * (task/timer/sub-agent notice, interrupt record) rather than a real user
@@ -152,12 +196,12 @@ const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 export function isSystemUserContent(content: MessageContentBlock[]): boolean {
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
-  const text = content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
-    .replace(ATTACHED_RE, "")
-    .trim();
+  const text = withoutAttachedMarkers(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  );
   return parseSystemMessage(text) !== null;
 }
 
@@ -169,9 +213,9 @@ export function isSystemUserContent(content: MessageContentBlock[]): boolean {
  * :returns: ``true`` for a task notification, ``false`` otherwise.
  */
 export function isClaudeTaskNotificationText(text: string): boolean {
-  const trimmed = text.trimStart();
+  const trimmed = text.trim();
   return (
-    trimmed.startsWith("<task-notification>") &&
+    /^<task-notification>[\s\S]*<\/task-notification>$/.test(trimmed) &&
     TASK_NOTIFICATION_MARKERS.every((marker) => trimmed.includes(marker))
   );
 }
@@ -212,10 +256,27 @@ export function claudeTaskNotificationMarker(text: string): string | null {
 export function taskNotificationMarkerContent(
   content: MessageContentBlock[],
 ): MessageContentBlock[] | null {
+  if (content.some((block) => !isTextBlock(block))) return null;
+  if (isClaudeAgentMessageContent(content)) return null;
+  if (content.some((block) => isTextBlock(block) && !isClaudeTaskNotificationText(block.text))) {
+    return null;
+  }
   for (const block of content) {
     if (!isTextBlock(block)) continue;
     const marker = claudeTaskNotificationMarker(block.text);
     if (marker !== null) return [{ type: "input_text", text: marker }];
   }
   return null;
+}
+
+// Must match UNATTENDED_RUN_NOTE in server/scheduled/fire.py. The browser contract
+// uses the server's note to catch drift; unknown or modified notes stay visible.
+export const AUTOMATION_CONTEXT_NOTE =
+  "<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching this run. No one can answer questions, approve requests or give input, so work toward the goal above on your own. Don't ask questions, wait for confirmation or stop to request permission. When something is unclear, make a reasonable assumption only if it is easy to reverse and within the user's authorization. Record each assumption, its basis and how easily it can be changed. For decisions that are hard to reverse, involve significant trade-offs or would likely surprise the user, record the options and your recommendation, and defer the affected work. Continue independent work that does not depend on those decisions. If an action is denied or requires unavailable approval, skip that action and explain the blocker. Continue independent work and permitted alternatives. Do not change permission settings to get past the restriction. Lead your final reply with unresolved decisions and assumptions, prioritizing those the user is most likely to want to change, then summarize what you did and anything you couldn't do.\n</omnigent-automation-context>";
+
+/** Hide only the canonical suffix; arbitrary text inside matching tags stays visible. */
+export function stripAutomationContext(text: string): string {
+  const suffix = `\n\n${AUTOMATION_CONTEXT_NOTE}`;
+  const trimmed = text.trimEnd();
+  return trimmed.endsWith(suffix) ? trimmed.slice(0, -suffix.length) : text;
 }

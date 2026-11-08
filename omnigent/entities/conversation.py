@@ -8,7 +8,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.inner.native_attachments import (
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
+    reject_authored_framework_notices,
+)
 from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
@@ -101,6 +105,8 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param session_todos: Latest native Plan display snapshot, restored after
+        Server restart without invoking the harness or replaying task work.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -219,6 +225,10 @@ class Conversation:
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
+    :param side_chat_parent_id: The session whose Workspace rail lists this
+        one as a side chat, or ``None`` when it is not a listed side chat.
+    :param family_id: Stable sibling-family identity, or ``None`` for a standalone
+        session. Membership does not confer execution parentage or access.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -240,8 +250,10 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    inference_snapshot: dict[str, Any] | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
@@ -261,17 +273,37 @@ class Conversation:
     # outstanding approval-prompt count (None = never written);
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
     # seconds, None = no live stamp) — carried on the row so a session list
-    # can judge runner liveness without a second connectivity query.
+    # can judge runner liveness without a second connectivity query;
+    # ``background_work_running`` is whether a background shell outlives the
+    # ended turn (None = never written); ``blocked_on`` is why a running
+    # session's agent is parked on a terminal prompt (None = not parked).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    background_work_running: bool | None = None
+    blocked_on: str | None = None
     project_id: str | None = None
+    side_chat_parent_id: str | None = None
+    family_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
+
+
+class StartupInputOptions(BaseModel):
+    """Request options retained only while a startup input awaits delivery."""
+
+    model_override: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    background_titles_enabled: bool = False
+    scheduled_run: ScheduledRunLogContext | None = None
+
+
+# Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
+_MAX_MESSAGE_PHASE_LENGTH = 64
 
 
 class MessageData(BaseModel):
@@ -295,6 +327,13 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
+    :param user_authored: Confirmed or conservatively preserved user input;
+        prevents legacy content cleanup from hiding literal agent markup.
+    :param subagent_return_id: Native task id of an explicitly completed child.
+    :param phase: Assistant-only harness label for the message, e.g. Codex
+        ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
+        Stored as given so clients can act on values added later; ``None``
+        when unset, not a string, or longer than 64 characters.
     """
 
     role: Literal["user", "assistant"]
@@ -302,8 +341,28 @@ class MessageData(BaseModel):
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
+    user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("content")
+    @classmethod
+    def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reject_authored_framework_notices(content)
+        return content
+
+    @field_validator("phase", mode="before")
+    @classmethod
+    def drop_malformed_phase(cls, phase: object) -> str | None:
+        """Read a malformed phase as unlabelled rather than rejecting the message."""
+        if isinstance(phase, str) and 0 < len(phase) <= _MAX_MESSAGE_PHASE_LENGTH:
+            return phase
+        return None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
@@ -313,10 +372,12 @@ class MessageData(BaseModel):
 
         :returns: The validated instance.
         :raises ValueError: If an assistant message is missing
-            ``agent``.
+            ``agent`` or a user message carries ``phase``.
         """
         if self.role == "assistant" and self.agent is None:
             raise ValueError("assistant messages require 'agent'")
+        if self.role == "user" and self.phase is not None:
+            raise ValueError("user messages cannot carry 'phase'")
         return self
 
 
@@ -367,12 +428,16 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param namespace: Tool namespace the model emitted the call under,
+        e.g. ``"container"``. ``None`` for the default namespace. Harnesses
+        that replay history must round-trip it with the call.
     """
 
     agent: str = Field(serialization_alias="model")
     name: str
     arguments: str
     call_id: str
+    namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):
@@ -382,10 +447,12 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
     output: str
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):
@@ -406,12 +473,21 @@ class ErrorData(BaseModel):
         notice (e.g. codex started a fresh thread) rather than a failure;
         ``None`` / ``"error"`` is the destructive default and is omitted from
         the wire so existing error items are unchanged.
+    :param title: Optional short headline naming the failure, e.g. ``"Codex can't
+        start until you sign in to Databricks"``. Kept so the card reads the
+        same after a reload as it did live.
+    :param cause: Optional one or two sentences explaining why it failed.
+    :param remediation: Optional concrete next step, e.g. the sign-in link
+        and code; the card offers it as an action.
     """
 
     source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
     level: Literal["error", "info"] | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @field_validator("code", "message")
     @classmethod
@@ -522,6 +598,7 @@ class CompactionData(BaseModel):
         :returns: The list with binary payloads replaced by a marker,
             or ``None`` unchanged.
         """
+        reject_authored_framework_notices(value)
         return redact_binary_payloads(value, _binary_payload_omitted)
 
 
@@ -648,6 +725,11 @@ class RoutingDecisionData(BaseModel):
         must still round-trip through stored rows and the wire instead
         of failing validation. ``None`` on rows written before the
         field existed.
+    :param task_description: Human label of the task/spawn this decision
+        governed, e.g. ``"Research auth flows"`` — what ties a fan-out's
+        decision to its sub-agent when every spawn shares one
+        :attr:`agent` type. ``None`` when the spawn carried none, and on
+        rows written before the field existed.
     """
 
     model: str
@@ -663,6 +745,7 @@ class RoutingDecisionData(BaseModel):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    task_description: str | None = None
 
     @field_validator("model")
     @classmethod
@@ -713,6 +796,9 @@ class SlashCommandData(BaseModel):
     name: str
     arguments: str
     output: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 ItemData = (
@@ -822,6 +908,8 @@ class NewConversationItem(BaseModel):
     # know whether a timed-out POST committed). Same 32-hex shape the store
     # mints itself; ``None`` keeps the store-assigned random id.
     stable_id: str | None = None
+    status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
+    replaces_pending_id: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -897,12 +985,16 @@ class ConversationItem(BaseModel):
 
         :returns: Flat dict, e.g. for an assistant message::
 
-            {"id": "msg_abc", "response_id": "resp_xyz",
-             "type": "message", "status": "completed",
-             "created_at": 1753900000,
-             "role": "assistant",
-             "content": [{"type": "output_text", "text": "hi"}],
-             "model": "databricks-gpt-5-4"}
+            {
+                "id": "msg_abc",
+                "response_id": "resp_xyz",
+                "type": "message",
+                "status": "completed",
+                "created_at": 1753900000,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+                "model": "databricks-gpt-5-4",
+            }
         """
         return {
             "id": self.id,

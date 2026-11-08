@@ -50,6 +50,7 @@ def _to_entity(row: SqlPolicy) -> Policy:
         enabled=bool(row.enabled),
         updated_at=row.updated_at,
         created_by=row.created_by,
+        workspace_id=row.workspace_id,
     )
 
 
@@ -179,6 +180,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
         name: str | None = None,
         handler: str | None = None,
         enabled: bool | None = None,
+        factory_params: dict[str, Any] | None = None,
     ) -> Policy | None:
         """
         Update mutable fields. Returns ``None`` if not found or
@@ -222,6 +224,11 @@ class SqlAlchemyPolicyStore(PolicyStore):
             if enabled is not None and bool(row.enabled) != enabled:
                 row.enabled = enabled
                 changed = True
+            if factory_params is not None:
+                encoded = json.dumps(factory_params)
+                if row.factory_params != encoded:
+                    row.factory_params = encoded
+                    changed = True
             if changed:
                 row.updated_at = updated_at
             session.flush()

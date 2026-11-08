@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 import sys
 import uuid
@@ -323,6 +324,41 @@ def test_write_policy_hook_config_creates_expected_files(tmp_path) -> None:
     assert len(bridge_config["token"]) > 0
 
 
+def _wrapper_hook_path(wrapper: Path) -> Path:
+    """The hook script the wrapper ``exec``s (the path after the interpreter)."""
+    for line in reversed(wrapper.read_text().splitlines()):
+        if line.startswith("exec "):
+            return Path(shlex.split(line)[-1])
+    raise AssertionError(f"no exec line in wrapper:\n{wrapper.read_text()}")
+
+
+def test_write_policy_hook_config_wrapper_execs_existing_hook(tmp_path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "session-123")
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"wrapper execs a non-existent hook: {hook}"
+    from omnigent.inner import hermes_policy_hook
+
+    assert hook == Path(hermes_policy_hook.__file__).resolve()
+
+
+def test_inject_relay_into_policy_hook_wrapper_execs_existing_hook(tmp_path: Path) -> None:
+    hermes_home = b.write_policy_hook_config(tmp_path, "http://ap", "conv_h")
+    assert b.inject_relay_into_policy_hook(
+        tmp_path,
+        relay_url="http://127.0.0.1:9999",
+        relay_token="relay-tok",
+        server_url="http://ap",
+        session_id="conv_h",
+    )
+
+    hook = _wrapper_hook_path(hermes_home / "omnigent-policy-hook.sh")
+    assert hook.is_file(), f"relay-rewritten wrapper execs a non-existent hook: {hook}"
+
+
 def test_write_policy_hook_config_copies_user_files(tmp_path, monkeypatch) -> None:
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -357,6 +393,64 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     assert config["model"] == "claude-sonnet-4-20250514"
     assert config["providers"] == {"anthropic": {}}
     assert config["hooks_auto_accept"] is True
+
+
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_ci_provider_headers_survive_hermes_policy_config(
+    tmp_path, monkeypatch, caplog, context, legacy
+) -> None:
+    """Native and headless policy setup share the provider-scoped header boundary."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    gateway = {
+        "name": "databricks",
+        "base_url" if legacy else "api": "https://test.cloud.databricks.com/ai-gateway/codex/v1",
+        "key_env": "OPENAI_API_KEY",
+        "transport": "codex_responses",
+        "extra_headers": {"X-Existing": "kept", REQUEST_TAGS_HEADER: '{"team":"ci"}'},
+    }
+    external = {"name": "external", "base_url": "https://example.com/v1"}
+    malformed = {"name": "unused", "base_url": "https://[invalid"}
+    key = "custom_providers" if legacy else "providers"
+    original = {
+        "model": {"default": "test-model", "provider": "custom:databricks"},
+        key: [gateway, external, malformed]
+        if legacy
+        else {"databricks": gateway, "external": external, "unused": malformed},
+    }
+    user_home = tmp_path / ".hermes"
+    user_home.mkdir()
+    (user_home / "config.yaml").write_text(json.dumps(original))
+    (user_home / ".env").write_text("OPENAI_API_KEY=test-key\n")
+    monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
+    home = b.write_policy_hook_config(tmp_path / "bridge", "http://localhost:6767", "ci-test")
+    configured = json.loads((home / "config.yaml").read_text())
+    providers = configured[key]
+    provider = providers[0] if legacy else providers["databricks"]
+    assert (providers[1] if legacy else providers["external"]) == external
+    assert (providers[2] if legacy else providers["unused"]) == malformed
+    assert configured["model"] == original["model"]
+    assert provider["transport"] == "codex_responses"
+    assert provider["key_env"] == "OPENAI_API_KEY"
+    assert (home / ".env").read_text() == "OPENAI_API_KEY=test-key\n"
+    headers = provider["extra_headers"]
+    assert headers["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if context and context != "invalid":
+        expected.update(json.loads(context))
+    assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
+    assert gateway["extra_headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
 
 
 def test_read_hermes_home_returns_path_when_exists(tmp_path) -> None:

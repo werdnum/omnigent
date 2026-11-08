@@ -5,7 +5,8 @@ endpoint (a vendor API key, a subscription CLI login, a gateway like
 OpenRouter, a local Ollama, or a Databricks profile), the ``providers:``
 block in ``~/.omnigent/config.yaml`` is the source of truth for the
 active model selection. Defaults are **per family**: a provider marked
-**``default: true``** is the default for the family/families it serves,
+**``default: true``** is the default for the family/families it serves
+(gateway/local Gemini routing requires an explicit ``default: gemini`` scope),
 so a Claude (``anthropic``) default and a Codex (``openai``) default
 coexist (at most one default per family). This mirrors how multi-model
 tools key defaults by purpose — Zed's per-feature model pointers,
@@ -63,15 +64,8 @@ from omnigent.util.env_credentials import (
 
 _logger = logging.getLogger(__name__)
 
-# Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
-# native Claude); ``openai`` is the Responses/Chat surface (Codex,
-# native Codex, OpenAI-Agents SDK). ``pi`` consumes both. ``gemini`` is the
-# Google Gemini surface — the credential the native Antigravity (``agy``)
-# onboarding adopts as a ``key``-kind provider with a ``gemini:`` block from a
-# detected ``GEMINI_API_KEY``. It is key-only: a gateway/local proxy cannot
-# drive it, and the ``antigravity-native`` (``agy``) OAuth flavor consumes no
-# provider credential at all (its readiness is the file-based OAuth check in
-# :mod:`omnigent.onboarding.gemini_auth`, not a ``gemini:`` family here).
+# Protocol families: Anthropic Messages, OpenAI Responses/Chat, and native
+# Gemini generateContent (agy). Pi consumes the Anthropic/OpenAI surfaces.
 ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
 GEMINI_FAMILY = "gemini"
@@ -93,7 +87,7 @@ _PI_FALLBACK_FAMILIES = (ANTHROPIC_FAMILY, OPENAI_FAMILY)
 # ``default:`` value may reference (``default: ["anthropic", "pi"]``).
 # An inline key/gateway/local (with an anthropic/openai family) and a
 # databricks profile drive pi directly; a ``cli-config`` may claim the scope
-# too (a Databricks AI Gateway is pi-consumable — Pi speaks its Anthropic
+# too (a Databricks Unity Gateway is pi-consumable — Pi speaks its Anthropic
 # surface), with the actual gateway capability validated at resolution time.
 # A ``subscription`` (CLI login, unusable outside its own CLI) and ``bedrock``
 # (native-``omnigent claude`` only) can never drive pi — EXCEPT for a pi
@@ -352,6 +346,28 @@ class FamilyConfig:
         """
         return self.models.get("default")
 
+    def resolve_model_tier(self, model_id: str) -> str:
+        """Resolve a ``models:`` value that names another tier to its id.
+
+        Deployments alias tier names to ids (``deepseek-pro:
+        deepseek-v4-pro``) and reference those aliases from other keys
+        (``default: deepseek-pro``). Whatever reaches an endpoint — the
+        launch model, the picker's shortlist, the spawn env — must be the
+        concrete id, never the alias.
+
+        :param model_id: A ``models`` key or value, e.g. ``"deepseek-pro"``.
+        :returns: The concrete id the alias chain ends at, e.g.
+            ``"deepseek-v4-pro"``; *model_id* unchanged when it names no
+            other tier.
+        """
+        current = model_id
+        for _ in range(8):  # bounded: a cyclic alias map must terminate
+            alias = self.models.get(current)
+            if not isinstance(alias, str) or not alias or alias == current:
+                return current
+            current = alias
+        return model_id
+
 
 @dataclass(frozen=True)
 class ProviderEntry:
@@ -387,13 +403,15 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param connection: For managed ``kind="databricks"`` providers, ``"databricks"``
+        selects the session owner's connection. Mutually exclusive with ``profile``.
     :param model_provider: For ``kind="cli-config"`` only: the custom
         provider id in the CLI's config file that the launch pins, i.e. the
         ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
         otherwise.
     :param display_name: For ``kind="cli-config"`` only: the provider's
         human display name (the table's ``name`` field, snapshotted at
-        adoption), e.g. ``"Databricks AI Gateway"``. ``None`` otherwise and
+        adoption), e.g. ``"Databricks Unity Gateway"``. ``None`` otherwise and
         when the table named none.
     :param default_families: The set of model families this provider is
         the **default** for. Sourced from the entry's ``default:`` flag:
@@ -412,9 +430,12 @@ class ProviderEntry:
     families: dict[str, FamilyConfig] = field(default_factory=dict)
     cli: str | None = None
     profile: str | None = None
+    connection: str | None = None
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    # Databricks Gemini routing is opt-in and has a separate default scope.
+    native_gemini: bool = False
 
     @property
     def default(self) -> bool:
@@ -689,19 +710,11 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # The ``gemini`` family is consumed by the antigravity harness, which drives
-    # the google SDK with a STATIC GEMINI_API_KEY. ``auth_command`` mints a
-    # bearer token — useless as a GEMINI_API_KEY — so an ``auth_command`` gemini
-    # block is nonsensical. Reject it HERE (parse) so it never reaches
-    # provider_families / default-resolution / the display+readiness layer /
-    # spawn / ``/models``: every layer then agrees by construction. ``auth_command``
-    # stays valid for anthropic/openai families (gateways / dynamic tokens).
+    # agy sends static keys in x-goog-api-key; token refresh is not supported.
     if family_name == GEMINI_FAMILY and isinstance(auth_command_raw, str) and auth_command_raw:
         raise OmnigentError(
-            f"{prefix}.auth_command is not allowed on a 'gemini' family: the "
-            "antigravity harness drives Gemini with a static GEMINI_API_KEY, and "
-            "an auth_command mints a bearer token the google SDK cannot use as one. "
-            "Use a static key source ('api_key' or 'api_key_ref') instead.",
+            f"{prefix}.auth_command is not allowed on a 'gemini' family: "
+            "native agy requires a static 'api_key' or 'api_key_ref'.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -986,7 +999,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             display_name=display_name_raw if isinstance(display_name_raw, str) else None,
             # A codex cli-config provider serves the openai surface, like a codex
             # subscription. It may ALSO claim the pi scope (``default: [openai,
-            # pi]``) because a Databricks AI Gateway is pi-consumable (Pi speaks
+            # pi]``) because a Databricks Unity Gateway is pi-consumable (Pi speaks
             # its Anthropic surface natively). This is allowed structurally —
             # without reading the ambient ~/.codex/config.toml at parse — so a
             # user can pin pi→Databricks; whether the pinned provider is a *real*
@@ -1001,21 +1014,39 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
 
     if kind == DATABRICKS_KIND:
         profile_raw = raw.get("profile")
-        if not isinstance(profile_raw, str) or not profile_raw:
+        connection_raw = raw.get("connection")
+        if connection_raw is not None and (
+            connection_raw != "databricks" or profile_raw is not None
+        ):
             raise OmnigentError(
-                f"provider {name!r}: a 'profile' is required when kind is 'databricks'.",
+                f"provider {name!r}: use exactly one of profile or connection: databricks.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
-        # gemini: the antigravity harness drives Gemini via the dedicated google
-        # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
-        # profile cannot serve (or default) the Gemini surface.
+        if connection_raw is None and (not isinstance(profile_raw, str) or not profile_raw):
+            raise OmnigentError(
+                f"provider {name!r}: a profile or connection: databricks is required.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        native_gemini = raw.get("native_gemini", False)
+        if not isinstance(native_gemini, bool):
+            raise OmnigentError(
+                f"provider {name!r}: native_gemini must be a boolean", code=ErrorCode.INVALID_INPUT
+            )
+        if native_gemini and connection_raw is not None:
+            raise OmnigentError(
+                f"provider {name!r}: native Gemini requires a local Databricks profile; "
+                "connection: databricks is not supported. Use omni setup on the host.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        served = {GEMINI_FAMILY} if native_gemini else set(_PI_FALLBACK_FAMILIES)
         return ProviderEntry(
             name=name,
             kind=kind,
-            profile=profile_raw,
+            profile=profile_raw if isinstance(profile_raw, str) else None,
+            connection=connection_raw,
+            native_gemini=native_gemini,
             default_families=_parse_default_families(
-                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
+                name, default_raw, served, pi_capable=not native_gemini
             ),
         )
 
@@ -1031,26 +1062,13 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             "'anthropic', 'openai', or 'gemini' family.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # The Gemini surface is key-ONLY (the antigravity flavors need either a raw
-    # GEMINI_API_KEY or OAuth — never a proxy). A ``gateway`` / ``local`` may
-    # *carry* a gemini block alongside a real family (we ignore it for the Gemini
-    # surface — see :func:`provider_families`), but one whose ONLY family is
-    # gemini configures nothing it can actually serve: reject it loudly here.
-    if kind != KEY_KIND and set(families) == {GEMINI_FAMILY}:
-        raise OmnigentError(
-            f"provider {name!r} (kind {kind!r}) declares only a 'gemini' family, "
-            "but the Gemini surface is served only by a 'key' provider with a real "
-            "GEMINI_API_KEY (a gateway/local proxy cannot drive the antigravity "
-            "harness). Use kind: 'key', or add an 'anthropic'/'openai' family.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    # Scope the parseable default to the families this kind can actually serve:
-    # a gateway/local's gemini block never grants the Gemini surface, so a
-    # hand-edited ``default: gemini`` on a gateway must fail at parse (parity
-    # with how a databricks profile cannot name the gemini scope).
     served_for_default = set(families)
-    if kind != KEY_KIND:
-        served_for_default -= {GEMINI_FAMILY}
+    if kind in {GATEWAY_KIND, LOCAL_KIND} and (
+        default_raw is True
+        or (isinstance(default_raw, str) and default_raw.strip().lower() == "true")
+    ):
+        # Legacy gateway/local Gemini blocks must not take over agy on upgrade.
+        served_for_default.discard(GEMINI_FAMILY)
     return ProviderEntry(
         name=name,
         kind=kind,
@@ -1075,7 +1093,9 @@ def load_config() -> dict[str, object]:
         ``{"providers": {"openrouter": {"kind": "gateway", ...}}}``, or
         ``{}`` when the config file is missing, empty, or unreadable.
     """
-    return _load_config()
+    from omnigent.inference_config import load_runtime_inference_config
+
+    return load_runtime_inference_config()
 
 
 def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
@@ -1120,7 +1140,9 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
     return result
 
 
-def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
+def provider_credential_env_vars(
+    config: dict[str, object], *, include_dollar_key_refs: bool = False
+) -> frozenset[str]:
     """Return the env var names referenced by provider ``api_key_ref`` entries.
 
     Scans all inline-family providers (``key`` / ``gateway`` / ``local``) in
@@ -1136,12 +1158,15 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
     credential env vars into the runner subprocess without requiring the user
     to list them in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` by hand.
 
-    Only ``env:``-style references are included.  ``keychain:`` refs resolve
+    Saved sandbox profiles also include dollar references in ``api_key_ref``
+    when ``include_dollar_key_refs`` is enabled. ``keychain:`` refs resolve
     through the secret store and are never env vars.  ``auth_command`` is a
     shell command, not a static env var.  ``base_url`` env-refs are omitted
     because the URL is not a credential.
 
     :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
+    :param include_dollar_key_refs: Forward dollar-style ``api_key_ref`` entries
+        from a saved sandbox profile; defaults to legacy forwarding behavior.
     :returns: Env var names (and their ``OMNIGENT_`` aliases) that provider
         credential fields reference, e.g.
         ``frozenset({"MY_TOKEN", "OMNIGENT_MY_TOKEN"})``.
@@ -1156,8 +1181,17 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
                     names.add(n)
             # api_key: $VAR or ${VAR} — inline $VAR reference (unresolved at
             # parse time; expanded lazily by _expand_family).
-            if family.api_key is not None:
-                for match in _ENV_REF_RE.finditer(family.api_key):
+            dollar_refs = [family.api_key]
+            if (
+                include_dollar_key_refs
+                and family.api_key_ref is not None
+                and family.api_key_ref.startswith("$")
+            ):
+                dollar_refs.append(family.api_key_ref)
+            for reference in dollar_refs:
+                if reference is None:
+                    continue
+                for match in _ENV_REF_RE.finditer(reference):
                     var = match.group(1) or match.group(2)
                     for n in env_names_with_omnigent_prefix(var):
                         names.add(n)
@@ -1183,7 +1217,7 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
 
     Most ``cli-config`` providers (a custom codex ``[model_providers.X]``) are
     unusable outside their own CLI, so they never serve pi. The exception is a
-    Databricks AI Gateway: it exposes an Anthropic Messages surface Pi speaks
+    Databricks Unity Gateway: it exposes an Anthropic Messages surface Pi speaks
     natively, and :func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`
     translates it into a Pi gateway config (and the gateway-harness pi path
     routes it too — see ``configure_agent_harness_with_provider``). So a
@@ -1196,7 +1230,7 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     by call time both modules are fully loaded, so the lazy import is safe.
 
     :param entry: The provider entry to classify.
-    :returns: ``True`` iff *entry* is a ``cli-config`` Databricks AI Gateway
+    :returns: ``True`` iff *entry* is a ``cli-config`` Databricks Unity Gateway
         Pi can route through.
     """
     if entry.kind != CLI_CONFIG_KIND:
@@ -1221,7 +1255,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
       surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
       "use Pi's own native auth"). Other CLIs serve nothing.
-    - ``databricks``: both families plus pi — ucode routes the Claude,
+    - ``databricks``: Gemini only when ``native_gemini`` is enabled;
+      otherwise both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
     :param entry: The provider entry to classify.
@@ -1238,16 +1273,6 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         return frozenset(entry.families)
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         served = frozenset(entry.families)
-        # The Gemini surface is key-ONLY: it is consumed by the antigravity
-        # flavors (the SDK harness via a raw GEMINI_API_KEY, antigravity-native
-        # via OAuth), neither driveable by a gateway / local proxy. So a
-        # ``gateway`` / ``local`` declaring a ``gemini:`` block must NOT claim
-        # the Gemini surface — only a ``key`` may. Stripping it here (rather than
-        # at parse) keeps a multi-family gateway usable for its anthropic /
-        # openai surfaces; a gateway whose ONLY family is gemini is rejected at
-        # parse (see :func:`_parse_provider`).
-        if entry.kind != KEY_KIND:
-            served = served - {GEMINI_FAMILY}
         # pi consumes the anthropic / openai families only — a gemini-only key
         # serves just the Gemini surface, never pi (see ``_PI_FALLBACK_FAMILIES``).
         # Granting pi here would let the add flow auto-default pi to a gemini key
@@ -1283,9 +1308,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi, never the Gemini surface (which
-        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
-        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
+        served = frozenset(_PI_FALLBACK_FAMILIES) | {PI_SURFACE}
+        return frozenset({GEMINI_FAMILY}) if entry.native_gemini else served
     return frozenset()
 
 
@@ -1355,7 +1379,7 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     skipping ``subscription`` and ``bedrock`` defaults (a CLI login is
     unusable outside its own CLI, and ``bedrock`` is native-``omnigent
     claude`` only — routing pi to either fails). A ``cli-config`` default is
-    skipped UNLESS it is a pi-consumable Databricks AI Gateway (see
+    skipped UNLESS it is a pi-consumable Databricks Unity Gateway (see
     :func:`_cli_config_serves_pi`): such a gateway exposes an Anthropic
     surface Pi speaks natively, so pi-native translates it
     (``_cli_config_pi_provider``) and the gateway-harness pi path routes it
@@ -1394,7 +1418,7 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
             continue
         # A cli-config provider pins a model_provider in the codex CLI's own
         # config.toml. Most such pins are unusable outside codex, BUT a
-        # Databricks AI Gateway exposes an Anthropic surface Pi speaks natively
+        # Databricks Unity Gateway exposes an Anthropic surface Pi speaks natively
         # (translated by ``_cli_config_pi_provider`` for pi-native, and routed
         # by ``configure_agent_harness_with_provider`` for the gateway-harness
         # pi path). Route pi to it rather than skipping; a non-Databricks
@@ -1672,14 +1696,17 @@ def set_default_provider(
             result[provider_name] = entry
             continue
         parsed = _parse_provider(provider_name, entry)
-        served = provider_families(parsed)
+        served = set(provider_families(parsed))
+        if parsed.kind in {GATEWAY_KIND, LOCAL_KIND}:
+            # Preserve Gemini's explicit opt-in when serializing new defaults.
+            served.discard(GEMINI_FAMILY)
         if provider_name == name:
             new_defaults = parsed.default_families | scope
         else:
             # Other providers lose exactly the scoped family/families.
             new_defaults = parsed.default_families - scope
         body = {k: v for k, v in entry.items() if k != "default"}
-        raw_value = _default_raw_value(new_defaults, set(served))
+        raw_value = _default_raw_value(new_defaults, served)
         if raw_value is not None:
             body["default"] = raw_value
         result[provider_name] = body

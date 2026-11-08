@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal, TypeAlias
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -30,6 +31,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     external_session_id: str | None = None
     parent_session_id: str | None = None
     root_session_id: str | None = None
+    inference_config: dict[str, object] | None = None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -49,6 +51,12 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # message, so a recovery turn started from history would process it twice
     # (once from the recovery path, once from the buffered forward).
     suppress_recovery_turn: bool = False
+    # Resume an interrupted child task in its existing native session.
+    resume_interrupted_turn: bool = False
+    recovery_id: str | None = None
+    # The relay lets a pane-inferred status only annotate a running turn; an older
+    # server would let it reopen one a hook just closed.
+    accepts_inferred_status: bool = False
 
 
 def build_runner_session_init_payload(
@@ -56,8 +64,12 @@ def build_runner_session_init_payload(
     *,
     server_version: str,
     suppress_recovery_turn: bool = False,
+    resume_interrupted_turn: bool = False,
+    recovery_id: str | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
+    from omnigent.inference_config import snapshot_runtime_config
+
     if conversation.agent_id is None:
         raise ValueError("runner session initialization requires an agent_id")
     envelope = RunnerSessionInitEnvelope(
@@ -67,6 +79,9 @@ def build_runner_session_init_payload(
         agent_id=conversation.agent_id,
         sub_agent_name=conversation.sub_agent_name,
         suppress_recovery_turn=suppress_recovery_turn,
+        resume_interrupted_turn=resume_interrupted_turn,
+        recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
+        accepts_inferred_status=True,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
@@ -80,6 +95,7 @@ def build_runner_session_init_payload(
             external_session_id=conversation.external_session_id,
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
+            inference_config=snapshot_runtime_config(conversation.inference_snapshot),
         ),
     )
     return {
@@ -88,6 +104,22 @@ def build_runner_session_init_payload(
         "sub_agent_name": conversation.sub_agent_name,
         SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
     }
+
+
+class RunnerInferenceConfigMismatch(ValueError):
+    """A session cannot share a runner carrying another saved provider configuration."""
+
+
+def validate_runner_inference_config(expected: dict[str, object] | None) -> None:
+    """Require the session to use the provider map the runner loaded at launch."""
+    from omnigent.inference_config import load_runtime_inference_config
+
+    actual = load_runtime_inference_config({})
+    expected = expected or {}
+    if any(actual.get(key, {}) != expected.get(key, {}) for key in ("providers", "inference")):
+        raise RunnerInferenceConfigMismatch(
+            "This runner has a different saved provider configuration; launch a new runner."
+        )
 
 
 def parse_runner_session_init_envelope(

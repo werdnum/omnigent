@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -5,10 +10,16 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseAgentsModule from "@/hooks/useAgents";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { MobileHeaderButton, MobileHeaderButtonGroup } from "@/shell/MobileHeaderButton";
+import {
+  MobileHeaderControlsProvider,
+  MobileHeaderControlsSlot,
+} from "@/shell/MobileHeaderControlsSlot";
 import { useChatStore } from "@/store/chatStore";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -26,8 +37,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so these tests don't need a QueryClientProvider, matching
 // the workspace-files stub above.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => useGithubInfoMock(),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => usePullRequestInfoMock(),
 }));
 vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
   ...(await importOriginal<typeof FileViewerContextModule>()),
@@ -36,23 +47,42 @@ vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
 // PR/context/branch now render in the workspace bar via these shared hooks
 // (their own component + hook tests cover the variations); stub them so the
 // composer renders in isolation with a neutral empty status.
+const { useComposerGitStatusMock } = vi.hoisted(() => ({
+  useComposerGitStatusMock: vi.fn(),
+}));
 vi.mock("@/hooks/useComposerGitStatus", () => ({
-  useComposerGitStatus: () => ({
+  useComposerGitStatus: () => useComposerGitStatusMock(),
+}));
+
+function composerGitStatus(overrides: Record<string, unknown> = {}) {
+  return {
     branch: null,
     branchState: "unknown",
     isWorktree: null,
     worktreePath: null,
     creationBranch: null,
-    repoNameWithOwner: null,
+    repoNameWithOwner: "omnigent-ai/omnigent",
+    githubState: "ready",
     prCount: 0,
     prNumber: null,
     refresh: () => {},
     refreshing: false,
-  }),
-}));
+    ...overrides,
+  };
+}
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: () => ({ children: [] }),
+}));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+// /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
+// so these renders don't need a QueryClientProvider either.
+vi.mock("@/hooks/useAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentsModule>()),
+  useSessionAgent: () => ({ data: undefined, isError: false }),
 }));
 
 // HostBadge now lives in the status-line tray (left of the worktree branch).
@@ -64,13 +94,13 @@ const {
   useSessionMock,
   useHostsMock,
   useSessionHostOnlineMock,
-  useGithubInfoMock,
+  usePullRequestInfoMock,
   openGithubTabMock,
 } = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
-  useGithubInfoMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
   openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -114,6 +144,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     isWorking: false,
     disabled: false,
     onSend: vi.fn(),
+    onNewSession: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
     selectedAgentId: null,
@@ -167,18 +198,18 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
-    useGithubInfoMock.mockReset().mockReturnValue({ data: undefined });
+    usePullRequestInfoMock.mockReset().mockReturnValue({ data: undefined });
+    useComposerGitStatusMock.mockReset().mockReturnValue(composerGitStatus());
     openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
-      skills: [],
       contextWindow: null,
       tokensUsed: null,
       sessionCostUsd: null,
       gitBranch: null,
       llmModel: null,
-      selectedModel: null,
-      selectedEffort: null,
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
@@ -241,7 +272,7 @@ describe("Composer status line (branch + context ring)", () => {
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
-      selectedEffort: "medium",
+      sessionReasoningEffort: "medium",
       nativeVendorOwnsModel: true,
       contextWindow: 100_000,
       tokensUsed: 25_000,
@@ -325,7 +356,14 @@ describe("Composer status line (branch + context ring)", () => {
     // The host indicator moved out of the chat header into this tray; it
     // sits immediately left of the worktree branch.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    useComposerGitStatusMock.mockReturnValue(
+      composerGitStatus({
+        branch: "geist",
+        branchState: "ready",
+        isWorktree: true,
+        worktreePath: "/workspace/geist",
+      }),
+    );
     renderComposer();
 
     const host = screen.getByTestId("composer-host-select");
@@ -355,6 +393,67 @@ describe("Composer status line (branch + context ring)", () => {
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
   });
 
+  it.each([true, false])(
+    "places host and model controls beside overflow only on mobile (%s)",
+    (mobile) => {
+      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...mediaQuery,
+        media: query,
+        matches: mobile && query === "(max-width: 767.98px)",
+      }));
+      bindHost("mac-laptop");
+      useSessionHostOnlineMock.mockReturnValue(false);
+      const onShowReconnectHelp = vi.fn();
+      render(
+        <MobileHeaderControlsProvider>
+          <TooltipProvider>
+            <MobileHeaderButtonGroup data-testid="header-actions">
+              <MobileHeaderControlsSlot sessionId="conv_test" />
+              <MobileHeaderButton aria-label="Conversation actions">…</MobileHeaderButton>
+            </MobileHeaderButtonGroup>
+            <Composer {...composerProps({ onShowReconnectHelp })} />
+          </TooltipProvider>
+        </MobileHeaderControlsProvider>,
+      );
+
+      const host = screen.getByTestId("composer-host-select");
+      const harness = screen.getByTestId("composer-config-gear");
+      const group = screen.getByTestId("header-actions");
+      const actions = screen.getByTestId("composer-action-row");
+      if (mobile) {
+        expect(group).toContainElement(host);
+        expect(actions).not.toContainElement(host);
+        expect(group).toContainElement(harness);
+        expect(actions).not.toContainElement(harness);
+        expect(screen.queryByTestId("composer-workspace-controls")).toBeNull();
+        expect(group.querySelectorAll(".glass-surface")).toHaveLength(1);
+        expect(group).toHaveClass("rounded-[20px]");
+        expect(screen.getByTestId("composer-host-icon")).toHaveClass("size-5");
+        expect(host).toHaveClass("[--icon-container-default:20px]");
+        expect(harness).toHaveClass("[--icon-container-default:20px]");
+        expect(harness.querySelector("img, svg")).toHaveClass("size-5");
+        expect(
+          host.compareDocumentPosition(
+            screen.getByRole("button", { name: "Conversation actions" }),
+          ) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      } else {
+        expect(actions).toContainElement(host);
+        expect(group).not.toContainElement(host);
+        expect(actions).toContainElement(harness);
+        expect(group).not.toContainElement(harness);
+        expect(screen.getByTestId("composer-workspace-controls")).toBeInTheDocument();
+        expect(group.querySelector(".glass-surface")).toBeNull();
+      }
+      fireEvent.keyDown(host, { key: "ArrowDown" });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
+      expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+      fireEvent.keyDown(harness, { key: "ArrowDown" });
+      expect(screen.getByTestId("composer-agent-menu")).toBeInTheDocument();
+    },
+  );
+
   it("keeps the tray hidden for a session with no host and nothing else to show", () => {
     // onShowReconnectHelp is now passed for every session, so it must not
     // resurrect an empty tray on a session with no host badge to hang it on.
@@ -371,7 +470,14 @@ describe("Composer status line (branch + context ring)", () => {
     // host_offline anyway — a stranded child is local_stranded, handled by the
     // banner elsewhere.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    useComposerGitStatusMock.mockReturnValue(
+      composerGitStatus({
+        branch: "geist",
+        branchState: "ready",
+        isWorktree: true,
+        worktreePath: "/workspace/geist",
+      }),
+    );
     renderComposer({ subAgentLabel: "check-eligibility" });
 
     expect(screen.queryByTestId("composer-host-select")).toBeNull();

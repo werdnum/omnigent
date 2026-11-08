@@ -54,9 +54,18 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.live_server import find_free_port
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
+from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
-from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
+from tests.e2e.helpers import (
+    HEALTH_TIMEOUT_S,
+    POLL_INTERVAL_S,
+    harness_model_base_url,
+    lookup_databricks_host,
+    model_base_url,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -194,19 +203,6 @@ _SYS_TERMINAL_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sys-te
 # only binds built-in agents, and plain (not the polly supervisor) so a
 # recall assertion isn't flaky.
 _SDK_CHAT_BUILTIN_SPEC = _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
-
-
-def find_free_port() -> int:
-    """
-    Find a free TCP port by binding to port 0.
-
-    :returns: An available port number.
-    """
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def wait_for_server(base_url: str, timeout: float = 20.0) -> None:
@@ -372,6 +368,7 @@ def configure_mock_llm(
     *,
     key: str = "default",
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -385,11 +382,9 @@ def configure_mock_llm(
     Use different keys to give each agent its own response stream::
 
         # Parent agent uses "mock-parent" model
-        configure_mock_llm(url, [{"text": "spawning reviewer..."}],
-                           key="mock-parent")
+        configure_mock_llm(url, [{"text": "spawning reviewer..."}], key="mock-parent")
         # Sub-agent uses "mock-reviewer" model
-        configure_mock_llm(url, [{"text": "LGTM"}],
-                           key="mock-reviewer")
+        configure_mock_llm(url, [{"text": "LGTM"}], key="mock-reviewer")
 
     Pass *match* to route by request CONTENT instead of model: the queue
     serves any request whose ``role="user"`` input contains the token.
@@ -409,6 +404,8 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param required_tools: Advertised tools required to consume this queue,
+        isolating agent turns from background generation and review.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -423,6 +420,8 @@ def configure_mock_llm(
     }
     if match is not None:
         payload["match"] = match
+    if required_tools is not None:
+        payload["required_tools"] = required_tools
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json=payload,
@@ -527,6 +526,20 @@ def get_mock_requests(
         params=params,
         timeout=5.0,
     )
+    resp.raise_for_status()
+    return resp.json()["requests"]
+
+
+def get_mock_message_requests(mock_llm_server_url: str, *, key: str | None = None) -> list[dict]:
+    """
+    Retrieve captured Anthropic Messages requests with their beta flags.
+
+    :param mock_llm_server_url: Mock server URL.
+    :param key: When set, only return requests whose ``model`` field matches this key.
+    :returns: Entries shaped ``{"body": <request body>, "betas": [<flag>, ...]}``.
+    """
+    params = {"key": key} if key is not None else {}
+    resp = httpx.get(f"{mock_llm_server_url}/mock/message_requests", params=params, timeout=5.0)
     resp.raise_for_status()
     return resp.json()["requests"]
 
@@ -678,7 +691,9 @@ def live_server(
         # include /v1 in the base so the SDK hits /v1/responses.
         env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
     elif databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = harness_model_base_url(
+            databricks_workspace_host, request.config.getoption("--harness")
+        )
         # Thread --profile so claude-sdk and other harnesses that read
         # ~/.databrickscfg directly pick the right profile. Without it
         # ClaudeSDKExecutor falls through and 403s.
@@ -750,7 +765,7 @@ def live_server(
                         # depend on which test boots it first.
                         "model": resolve_model("databricks-gpt-5-4-mini", key="live-server"),
                         "connection": {
-                            "base_url": f"{databricks_workspace_host}/serving-endpoints",
+                            "base_url": model_base_url(databricks_workspace_host, "mlflow/v1"),
                             "api_key": llm_api_key,
                         },
                     }
@@ -820,7 +835,7 @@ def live_server(
                 and status_resp.json()["online"] is True
             ):
                 break
-        except httpx.ConnectError:
+        except httpx.TransportError:
             pass
         time.sleep(POLL_INTERVAL_S)
     else:
@@ -850,7 +865,8 @@ def live_server(
         )
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         runner_proc = _live_runner_state.get("process", runner_proc)
         if runner_proc.poll() is None:
@@ -962,6 +978,7 @@ def upload_agent(
     *,
     rewrite_model_for_databricks: bool = False,
     databricks_profile: str | None = None,
+    operator_authored: bool = False,
 ) -> str:
     """
     Upload an agent bundle via multipart ``POST /v1/sessions``.
@@ -984,6 +1001,7 @@ def upload_agent(
         no profile and 401; harness agents that already carry a
         profile are left untouched. Only applied when
         ``rewrite_model_for_databricks`` is True.
+    :param operator_authored: Register through local stores like ``server --agent``.
     :returns: The agent name.
     """
     bundle = build_agent_bundle(
@@ -991,21 +1009,11 @@ def upload_agent(
         rewrite_model_for_databricks=rewrite_model_for_databricks,
         databricks_profile=databricks_profile,
     )
-    import json as _json
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                bundle,
-                "application/gzip",
-            ),
-        },
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    provision = post_operator_session if operator_authored else post_session_bundle
+    resp = provision(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code == 409:
         return agent_dir.name
@@ -1027,12 +1035,14 @@ def register_inline_agent(
     mock_llm_base_url: str | None = None,
     builtin_tools: list[str] | None = None,
     extra_config: dict[str, Any] | None = None,
+    operator_authored: bool = False,
 ) -> str:
     """
     Register a single-file omnigent agent built in-memory.
 
     Tarballs a minimal ``<name>.yaml`` (no directory on disk) and
-    uploads it via multipart ``POST /v1/sessions``. Idempotent: a
+    uploads it via multipart ``POST /v1/sessions`` by default. Operator-owned
+    fixtures can opt into local registration. Idempotent: a
     409 (already registered from a prior parametrize row against the
     same session-scoped server) is treated as success. The model is
     load-balanced via :func:`tests._model_pools.resolve_model`.
@@ -1051,10 +1061,10 @@ def register_inline_agent(
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.
+    :param operator_authored: Register through local stores like ``server --agent``.
     :returns: The agent name (use the return value, not the *name*
         argument, they differ on rerun attempts).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1095,13 +1105,10 @@ def register_inline_agent(
             tar.addfile(info, io.BytesIO(yaml_bytes))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    provision = post_operator_session if operator_authored else post_session_bundle
+    resp = provision(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     # 409 = already registered by a prior parametrize row against the
     # same session-scoped server; treat as success. Explicit raise (not
@@ -1122,16 +1129,11 @@ def register_dir_agent_with_mock_llm(
     mock_llm_base_url: str,
 ) -> str:
     """
-    Register a directory-bundle agent that ships its function tools as
-    Python source under ``tools/python/``, routed at a mock LLM.
+    Register an operator-owned directory bundle routed at a mock LLM.
 
-    Unlike :func:`register_inline_agent` (a single ``<name>.yaml`` whose
-    tool callables are dotted import paths), this tars *agent_dir* — whose
-    ``tools/python/*.py`` files the server loads by absolute file path from
-    the unpacked bundle (auto-discovered, like the ``archer`` fixture). So
-    the tools resolve on any server version without the server importing
-    the repo's ``tests/`` tree — the server-version backwards-compat failure
-    mode that dotted ``tests.*`` callables hit when the server is isolated.
+    Python source tools require trusted registration, like ``server --agent``.
+    The live-server fixture supplies its own stores; the HTTP session create
+    references the registered agent by id.
 
     The bundle's ``config.yaml`` is stamped per call: ``name`` and
     ``executor.model`` are overridden and an ``executor.auth`` api-key block
@@ -1146,7 +1148,6 @@ def register_dir_agent_with_mock_llm(
     :param mock_llm_base_url: Mock server base URL including ``/v1``.
     :returns: The registered agent name (use the return value, not *name*).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1176,11 +1177,8 @@ def register_dir_agent_with_mock_llm(
                 tar.add(str(entry), arcname=str(entry.relative_to(agent_dir)))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    resp = post_operator_session(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"dir-agent register failed: {resp.status_code} {resp.text[:500]}")
@@ -1380,6 +1378,7 @@ def archer_agent(http_client: httpx.Client, databricks_workspace_host: str | Non
     return upload_agent(
         http_client,
         _ARCHER_DIR,
+        operator_authored=True,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
     )
 
@@ -1582,7 +1581,9 @@ def lookup_agent_id(client: httpx.Client, agent_name: str) -> str:
     :returns: The matching ``"ag_..."`` durable id.
     :raises AssertionError: If no session with that agent name exists.
     """
-    resp = client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+    )
     resp.raise_for_status()
     sessions = resp.json()["data"]
     if sessions:
@@ -1715,31 +1716,34 @@ def _flatten_session_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _output_after_input(items: list[dict[str, Any]], response_id: str) -> list[dict[str, Any]]:
+    """Select output after the requested user input, across harness response ids."""
+    after_input = False
+    output = []
+    for item in items:
+        flattened = _flatten_session_item(item)
+        if flattened.get("type") == "message" and flattened.get("role") == "user":
+            if item.get("response_id") == response_id:
+                after_input = True
+        elif after_input:
+            output.append(flattened)
+    return output
+
+
 def _session_items_for_response(
     client: httpx.Client,
     *,
     session_id: str,
     response_id: str,
 ) -> list[dict[str, Any]]:
-    """Return flat session items for a runner-native turn.
+    """Return output after the requested input's position in the transcript.
 
-    The AP-stamped user input ``response_id`` is only a local grouping id.
-    Runner-native output items use the harness-allocated response id, so
-    do not filter by ``response_id`` here. These E2E helpers create one
-    fresh session per turn; all non-user items in the snapshot belong to
-    the turn under observation.
+    Native output has a harness-allocated response id, so the input's id
+    locates the user message rather than filtering the output ids.
     """
-    del response_id
     resp = client.get(f"/v1/sessions/{session_id}")
     resp.raise_for_status()
-    return [
-        flattened
-        for item in resp.json().get("items", [])
-        if not (
-            (flattened := _flatten_session_item(item)).get("type") == "message"
-            and flattened.get("role") == "user"
-        )
-    ]
+    return _output_after_input(resp.json().get("items", []), response_id)
 
 
 def poll_session_until_terminal(
@@ -1756,7 +1760,8 @@ def poll_session_until_terminal(
     pollable Omnigent ``Task`` for ``GET /v1/responses/{response_id}``. This
     helper returns a Responses-like dict synthesized from the session
     snapshot: terminal status from ``session.status`` and output from
-    non-user ``conversation_items`` sharing the turn ``response_id``.
+    non-user items after the input with the requested ``response_id``. Native
+    harnesses may allocate a different response id for the output.
 
     :param client: HTTP client pointed at the live server.
     :param session_id: Session/conversation id.
@@ -1779,14 +1784,7 @@ def poll_session_until_terminal(
         status = last_body.get("status")
         if status in ("running", "waiting"):
             seen_running = True
-        output = [
-            flattened
-            for item in last_body.get("items", [])
-            if not (
-                (flattened := _flatten_session_item(item)).get("type") == "message"
-                and flattened.get("role") == "user"
-            )
-        ]
+        output = _output_after_input(last_body.get("items", []), response_id)
         has_turn_output = any(item.get("type") != "resource_event" for item in output)
         if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
             return {
@@ -1826,6 +1824,7 @@ def poll_for_pending_tool_calls(
     :returns: List of action_required function_call items.
     """
     deadline = time.monotonic() + timeout
+    seen_running = False
     while time.monotonic() < deadline:
         if session_id is None:
             resp = client.get(f"/v1/responses/{response_id}")
@@ -1854,7 +1853,10 @@ def poll_for_pending_tool_calls(
                 return pending
             snap = client.get(f"/v1/sessions/{session_id}")
             snap.raise_for_status()
-            if snap.json().get("status") in ("idle", "failed"):
+            status = snap.json().get("status")
+            seen_running = seen_running or status in ("running", "waiting")
+            has_turn_output = any(item.get("type") != "resource_event" for item in items)
+            if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
                 return []
         time.sleep(POLL_INTERVAL_S)
     return []
@@ -1908,7 +1910,7 @@ def resume_test_server(
     # primary live_server fixture above).
     apply_server_env(env, _REPO_ROOT)
     if databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
+        env["OPENAI_BASE_URL"] = model_base_url(databricks_workspace_host, "codex/v1")
     # See docstring: an allow-list would reject the CLI's own runner.
     env.pop("OMNIGENT_RUNNER_TUNNEL_TOKEN", None)
 

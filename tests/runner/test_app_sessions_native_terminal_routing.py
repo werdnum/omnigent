@@ -14,6 +14,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.process_logging import display_log_path
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     _auto_create_repl_terminal,
@@ -26,11 +27,12 @@ from omnigent.runner.resource_registry import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 @dataclass
@@ -268,10 +270,14 @@ async def test_create_session_terminal_ensure_failure_returns_json_without_live_
     assert len(error_id) == 36
     int(error_id.removeprefix("err_"), 16)
     assert error["message"] == (
-        "Native Claude terminal failed to start; "
-        f"see the runner log for details: {pinned_runner_log} Error ID: {error_id}."
+        "Native Claude terminal failed to start (ImportError); "
+        f"see the runner log for details: {display_log_path(pinned_runner_log)} "
+        f"Error ID: {error_id}."
     )
     assert "requires the 'claude' CLI" not in error["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in error["message"]
 
 
 @dataclass
@@ -636,7 +642,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched REPL terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -779,7 +785,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
 
     captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Captures the launched REPL terminal spec and parent os_env."""
 
         async def launch_auxiliary_terminal(
@@ -886,6 +892,10 @@ async def test_create_session_repl_terminal_dispatch(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     # Keep the codex-native branch's bridge writes inside tmp_path.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
@@ -894,12 +904,6 @@ async def test_create_session_repl_terminal_dispatch(
         name="dispatch-agent",
         executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
     )
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the parametrized spec for any agent id."""
-        del agent_id, session_id
-        return spec
 
     created_sessions: list[str] = []
 
@@ -932,14 +936,7 @@ async def test_create_session_repl_terminal_dispatch(
         "omnigent.runner.app._codex_session_needs_runner_terminal", _fake_codex_needs
     )
 
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        # A real (empty) registry: the dispatch gate requires one, and
-        # ``get()`` on it reports no existing REPL terminal.
-        terminal_registry=TerminalRegistry(),
-    )
+    app, _ = await _build_app_for_spec(spec, terminal_registry=TerminalRegistry())
 
     body: dict[str, Any] = {
         "session_id": "5eef02d60f39cba3fbd0ae188348643f",
@@ -957,10 +954,12 @@ async def test_create_session_repl_terminal_dispatch(
     assert created_sessions == (["5eef02d60f39cba3fbd0ae188348643f"] if expect_created else [])
 
 
+@pytest.mark.parametrize("cached_predecessor", [False, True])
 @pytest.mark.asyncio
 async def test_ensure_terminal_route_recreates_dead_registered_pane(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    cached_predecessor: bool,
 ) -> None:
     """Ensure route detects a dead-but-registered pane and auto-creates.
 
@@ -968,6 +967,7 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     registry retains a stale entry whose tmux pane is dead.
     ``get_terminal_resource`` probes ``is_alive()`` and returns ``None``,
     so the ensure route falls through to ``_auto_create_claude_terminal``.
+    A predecessor's cached liveness must not hide the replacement's death.
     The turn-time self-heal (``_ensure_native_terminal_for_turn``) delegates
     to this same ensure route after closing the stale registry entry.
 
@@ -1025,6 +1025,18 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     )
 
     async with _runner_client(app) as client:
+        if cached_predecessor:
+            predecessor = make_test_terminal_instance("claude", "main", tmp_path / "old")
+            with registry._lock:
+                registry._by_conversation[sid][("claude", "main")] = predecessor
+            assert (
+                await app.state.session_resource_registry.get_terminal_resource(
+                    sid, "terminal_claude_main"
+                )
+                is not None
+            )
+            with registry._lock:
+                registry._by_conversation[sid][("claude", "main")] = dead_instance
         resp = await client.post(
             f"/v1/sessions/{sid}/resources/terminals",
             json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},

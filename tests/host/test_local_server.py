@@ -8,13 +8,19 @@ Covers ``omnigent.host.local_server``: reuse-vs-respawn detection
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import textwrap
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import click
 import httpx
 import pytest
 
+import omnigent
 from omnigent.host import local_server
 
 
@@ -100,6 +106,40 @@ def test_local_server_url_if_healthy_none_when_pid_dead(
     monkeypatch.setattr("httpx.get", _must_not_probe)
 
     assert local_server.local_server_url_if_healthy() is None
+
+
+@pytest.mark.parametrize(
+    ("pidfile", "alive", "url", "expected"),
+    [
+        ("4242\n6767\n", True, "http://127.0.0.1:6767", True),
+        # Our server exited and another data dir's server now answers on :6767.
+        ("4242\n6767\n", False, "http://127.0.0.1:6767", False),
+        # Our server was respawned elsewhere; the old port belongs to someone else.
+        ("4242\n41234\n", True, "http://127.0.0.1:6767", False),
+        (None, True, "http://127.0.0.1:6767", False),
+    ],
+)
+def test_local_server_still_serves_trusts_only_this_data_dirs_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pidfile: str | None,
+    alive: bool,
+    url: str,
+    expected: bool,
+) -> None:
+    """Ownership comes from the pidfile alone, never from whoever answers the port."""
+    pid_file = tmp_path / "local_server.pid"
+    if pidfile is not None:
+        pid_file.write_text(pidfile)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", pid_file)
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: alive and pid == 4242)
+
+    def _must_not_probe(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("a foreign server's /health would look identical")
+
+    monkeypatch.setattr("httpx.get", _must_not_probe)
+
+    assert local_server.local_server_still_serves(url) is expected
 
 
 def test_local_server_url_if_healthy_none_when_no_pidfile(
@@ -207,18 +247,149 @@ def test_ensure_local_omnigent_server_respawns_on_config_drift(
     )
 
 
+def test_resolve_effective_base_path_falls_back_to_persisted_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no explicit opinion, the running server's persisted base path wins.
+
+    ``OMNIGENT_WEB_BASE_PATH`` is set only by the specific ``server
+    --background --base-path`` invocation that chose it; every later,
+    unrelated command has no opinion on it and must not be read as "root".
+    """
+    base_path_file = tmp_path / "local_server.base_path"
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_BASE_PATH_PATH", base_path_file)
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+
+    # No server has ever recorded one — root.
+    assert local_server._resolve_effective_base_path() == ""
+
+    base_path_file.write_text("/proxy/6767\n")
+    # Still unset this invocation — falls back to the persisted value.
+    assert local_server._resolve_effective_base_path() == "/proxy/6767"
+
+    # An explicit (even empty-after-normalization) opinion overrides it.
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/")
+    assert local_server._resolve_effective_base_path() == ""
+
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/absproxy/9000")
+    assert local_server._resolve_effective_base_path() == "/absproxy/9000"
+
+
+def test_ensure_local_omnigent_server_reuses_configured_base_path_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An invocation with no ``--base-path`` opinion reuses a subpath server.
+
+    Regression test: a server was launched with ``--base-path /proxy/6767``
+    (its sidecars persist that). A later, unrelated invocation (``omnigent
+    run``, ``connect``, ...) does not set ``OMNIGENT_WEB_BASE_PATH`` at all.
+    Before the fix, the signature computed "" for that field, never matched
+    the running server's stamped signature, and every such command silently
+    stopped and respawned the server back at the origin root.
+    """
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+    monkeypatch.setattr(
+        local_server, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123"
+    )
+    base_path_file = tmp_path / "local_server.base_path"
+    base_path_file.write_text("/proxy/6767\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_BASE_PATH_PATH", base_path_file)
+    # Stamp the sig as the original `--base-path /proxy/6767` launch would
+    # have: computed with that value in effect.
+    sig_file = tmp_path / "local_server.sig"
+    sig_file.write_text(local_server.server_config_signature() + "\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
+    monkeypatch.setattr(
+        local_server, "_LOCAL_SERVER_LOG_REF_PATH", tmp_path / "local_server.logpath"
+    )
+
+    def _must_not_popen(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("spawned a new server despite a healthy configured one existing")
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _must_not_popen)
+
+    result = local_server.ensure_local_omnigent_server()
+    assert result.url == "http://127.0.0.1:8123"
+    assert result.spawned is False
+
+
+def test_ensure_local_omnigent_server_respawn_injects_persisted_base_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A crash-recovery respawn with no explicit opinion still boots the
+    replacement server under the persisted base path — not just its sidecar.
+
+    Regression test: a server was launched with ``--base-path /proxy/6767``.
+    It crashes (or a version bump forces a respawn) and this invocation
+    has no ``OMNIGENT_WEB_BASE_PATH`` opinion of its own.
+    ``_resolve_effective_base_path`` correctly falls back to the persisted
+    value for the *signature* and the *sidecar record* — but the actual
+    spawned subprocess only inherits ``os.environ``, which lacks the var.
+    Without explicitly injecting it into the child's env, the replacement
+    server boots at root while its own freshly-stamped sidecar claims the
+    configured prefix, so every later invocation "correctly" reuses a
+    server that is silently wrong.
+    """
+    monkeypatch.delenv("OMNIGENT_WEB_BASE_PATH", raising=False)
+    # No healthy server — forces a spawn (stands in for a crash or a
+    # version-drift respawn; either way this invocation has no base-path
+    # opinion of its own).
+    monkeypatch.setattr(local_server, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(local_server, "pick_local_port", lambda preferred=8000: 8765)
+    base_path_file = tmp_path / "local_server.base_path"
+    base_path_file.write_text("/proxy/6767\n")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_BASE_PATH_PATH", base_path_file)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", tmp_path / "local_server.pid")
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", tmp_path / "local_server.sig")
+    monkeypatch.setattr(
+        local_server, "_LOCAL_SERVER_LOG_REF_PATH", tmp_path / "local_server.logpath"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+
+    captured: dict[str, object] = {}
+
+    class _Proc:
+        pid = 9001
+
+        def __init__(self, args: list[str], *, env: dict[str, str], **_kwargs: object) -> None:
+            captured["env"] = env
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _Proc)
+    monkeypatch.setattr(
+        local_server,
+        "_wait_for_local_omnigent_server",
+        lambda base_url, proc, log_path, timeout=45.0: None,
+    )
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda port: 9001)
+
+    result = local_server.ensure_local_omnigent_server()
+
+    assert result.spawned is True
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["OMNIGENT_WEB_BASE_PATH"] == "/proxy/6767"
+
+
+@pytest.mark.parametrize("features", ["usage_page", "-claude_osc_status"])
 def test_server_config_signature_changes_with_features(
     monkeypatch: pytest.MonkeyPatch,
+    features: str,
 ) -> None:
     """Changing the startup feature set forces a managed-server respawn."""
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    sig_off = local_server.server_config_signature()
+    default_signature = local_server.server_config_signature()
 
-    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
-    sig_on = local_server.server_config_signature()
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    overridden_signature = local_server.server_config_signature()
 
-    assert sig_off != sig_on
-    assert sig_on == local_server.server_config_signature()
+    assert default_signature != overridden_signature
+    assert overridden_signature == local_server.server_config_signature()
 
 
 def test_server_config_signature_changes_with_session_title_instructions(
@@ -350,6 +521,102 @@ def test_ensure_local_omnigent_server_spawns_when_none_healthy(
     # Ambient passthrough, no injection: the spawned server sees the
     # shell's own DATABRICKS_CONFIG_PROFILE, untouched.
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
+
+
+@pytest.mark.parametrize("entrypoint", ["module", "console", "runner"])
+def test_spawn_local_server_preserves_runtime_and_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entrypoint: str
+) -> None:
+    """Keep the selected runtime, cwd, and state paths without workspace imports."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "workspace_tool_module.py").write_text("def echo(message):\n    return message\n")
+    conflicting = workspace / "omnigent"
+    conflicting.mkdir()
+    (conflicting / "__init__.py").write_text(
+        'raise RuntimeError("conflicting workspace omnigent checkout was imported")\n'
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    for name in ("PYTHONSAFEPATH", "PYTHONPATH", "OMNIGENT_DATABASE_URI"):
+        monkeypatch.delenv(name, raising=False)
+
+    with patch.object(local_server.subprocess, "Popen") as popen:
+        local_server._spawn_local_server(8765, "")
+    popen.assert_called_once()
+    args = popen.call_args.args[0]
+    kwargs = popen.call_args.kwargs
+    module_index = args.index("-m")
+    assert args[module_index + 1 : module_index + 3] == ["omnigent.cli", "server"]
+    # Exercise the captured interpreter options without starting a server
+    # or inheriting the developer's credentials.
+    probe_env = {
+        name: value
+        for name, value in kwargs["env"].items()
+        if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
+    }
+    probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    probe = textwrap.dedent("""\
+        import contextlib, importlib.util, io, json, os, runpy, sys
+
+        startup_path = list(sys.path)
+        import omnigent
+        from omnigent.config import global_config_path
+        from omnigent.host.local_server import _local_data_dir
+
+        # --help runs the CLI entry without starting a server.
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                sys.argv = ["omnigent.cli", "--help"]
+                if os.environ["OMNIGENT_TEST_ENTRYPOINT"] == "module":
+                    runpy.run_module("omnigent.cli", run_name="__main__")
+                elif os.environ["OMNIGENT_TEST_ENTRYPOINT"] == "runner":
+                    from omnigent.runner import _entry
+                    async def complete():
+                        pass
+                    _entry._run_tunnel_from_env = complete
+                    _entry.main()
+                else:
+                    from omnigent.cli import main
+                    main()
+            except SystemExit as exc:
+                assert exc.code == 0, exc.code
+
+        print(json.dumps(dict(
+            workspace_module_found=importlib.util.find_spec("workspace_tool_module") is not None,
+            dispatch_path=list(sys.path),
+            safe_path=sys.flags.safe_path,
+            startup_path=startup_path,
+            cwd=os.getcwd(),
+            runtime=omnigent.__file__,
+            config=str(global_config_path()),
+            data=str(_local_data_dir()),
+        )))
+    """)
+    result = subprocess.run(
+        [*args[:module_index], "-c", probe],
+        cwd=kwargs.get("cwd"),
+        env={**probe_env, "OMNIGENT_TEST_ENTRYPOINT": entrypoint},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    observed = json.loads(result.stdout)
+    assert "" not in observed["startup_path"]
+    assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
+    assert observed["safe_path"] is True
+    assert not observed["workspace_module_found"]
+    assert "" not in observed["dispatch_path"]
+    assert workspace.resolve() not in {
+        Path(entry).resolve() for entry in observed["dispatch_path"]
+    }
+    assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
+    assert Path(observed["cwd"]) == workspace.resolve()
+    assert Path(observed["config"]) == local_server.global_config_path()
+    assert Path(observed["data"]) == local_server._local_data_dir()
 
 
 def test_stop_local_omnigent_server_waits_for_process_exit(
@@ -831,6 +1098,7 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_process_uses_local_data_dir", lambda pid: True)
     terminated: list[int] = []
     monkeypatch.setattr(local_server, "_terminate_pid", terminated.append)
 
@@ -839,6 +1107,64 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     # The first lsof PID is the listener; it must actually be terminated.
     assert result == 93359
     assert terminated == [93359]
+
+
+def test_stop_untracked_local_server_preserves_other_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_server, "_local_server_health_ok", lambda url: True)
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda port: 93359)
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_process_uses_local_data_dir", lambda pid: False)
+    monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
+    assert local_server.stop_untracked_local_server(port=8000) is None
+
+
+@pytest.mark.parametrize(
+    "home_name,data_dir,expected",
+    [
+        ("owner", None, True),
+        ("other", None, False),
+        ("other", "{root}/owner/.omnigent", True),
+        ("owner", "{root}/other/.omnigent", False),
+        ("owner", ".omnigent", True),
+        ("owner", ".", False),
+        ("owner", "~", False),
+        ("owner", "~/.omnigent", True),
+        ("owner", "~///.omnigent", True),
+        ("other", "~//{root}/owner/.omnigent", False),
+        (None, "{root}/owner/.omnigent", True),
+        (None, "~/.omnigent", False),
+        (None, None, False),
+    ],
+)
+def test_process_runtime_ownership_uses_its_environment_and_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    home_name: str | None,
+    data_dir: str | None,
+    expected: bool,
+) -> None:
+    owner_home = tmp_path / "owner"
+    monkeypatch.setattr(local_server, "_local_data_dir", lambda: owner_home / ".omnigent")
+    environment = {"USERPROFILE": str(owner_home)} if os.name == "posix" else {}
+    if home_name is not None:
+        environment["HOME"] = str(tmp_path / home_name)
+    if data_dir is not None:
+        environment["OMNIGENT_DATA_DIR"] = data_dir.format(root=tmp_path)
+    with patch.object(local_server.psutil, "Process") as process:
+        process.return_value.environ.return_value = environment
+        process.return_value.cwd.return_value = str(owner_home)
+        assert local_server._process_uses_local_data_dir(93359) is expected
+
+
+@pytest.mark.parametrize("error_name", ["AccessDenied", "NoSuchProcess"])
+def test_process_runtime_ownership_refuses_uninspectable_process(
+    error_name: str,
+) -> None:
+    with patch.object(local_server.psutil, "Process") as process:
+        process.return_value.environ.side_effect = getattr(local_server.psutil, error_name)(93359)
+        assert local_server._process_uses_local_data_dir(93359) is False
 
 
 def test_stop_untracked_local_server_noop_when_nothing_listening(
@@ -1478,7 +1804,88 @@ def test_spawn_normalizes_paas_postgres_uri(
 
     monkeypatch.setattr(local_server.subprocess, "Popen", _Proc)
 
-    local_server._spawn_local_server(6767)
+    local_server._spawn_local_server(6767, "")
 
     uri = captured_args[captured_args.index("--database-uri") + 1]
     assert uri == "postgresql+psycopg://user:pw@127.0.0.1:5432/db"
+
+
+def test_local_server_base_path_applies_only_to_the_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The configured prefix is returned for the local managed server (loopback
+    on the recorded pidfile port), and never for a remote --server or a
+    different port, even when this machine's sidecar/env names a base path.
+
+    Probe-free: matches against the recorded pidfile, not a /health probe."""
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+
+    # Local managed server URL -> carries the prefix (trailing slash tolerated).
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == "/proxy/6767"
+    assert local_server.local_server_base_path("http://127.0.0.1:6767/") == "/proxy/6767"
+    assert local_server.local_server_base_path("http://localhost:6767") == "/proxy/6767"
+    # A remote --server is a different host -> never inherits the local prefix.
+    assert local_server.local_server_base_path("https://remote.example.com") == ""
+    # A different loopback port is a different server -> no prefix.
+    assert local_server.local_server_base_path("http://127.0.0.1:9999") == ""
+
+
+def test_local_server_base_path_empty_for_root_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local server with no configured base path yields "" (root, unchanged)."""
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "")
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""
+
+
+def test_local_server_base_path_empty_when_no_local_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no local server pidfile, there is nothing to prefix."""
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+    assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""
+
+
+def test_runtime_module_subprocesses_use_safe_import_paths() -> None:
+    """Keep every runtime Python module launch from adding its inherited cwd."""
+    import ast
+
+    import omnigent_client
+
+    violations = []
+    launches = 0
+    for package in (omnigent, omnigent_client):
+        root = Path(package.__file__).parent
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    args = node.elts
+                elif isinstance(node, ast.Call):
+                    args = node.args
+                else:
+                    continue
+                for i, arg in enumerate(args):
+                    if not (
+                        isinstance(arg, ast.Attribute)
+                        and arg.attr == "executable"
+                        and isinstance(arg.value, ast.Name)
+                        and arg.value.id == "sys"
+                    ):
+                        continue
+                    options = []
+                    for option in args[i + 1 :]:
+                        if not isinstance(option, ast.Constant) or not isinstance(
+                            option.value, str
+                        ):
+                            break
+                        if option.value == "-m":
+                            launches += 1
+                            if not {"-P", "-I"}.intersection(options):
+                                violations.append(f"{path.relative_to(root)}:{arg.lineno}")
+                            break
+                        options.append(option.value)
+    assert launches > 0
+    assert violations == []

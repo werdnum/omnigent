@@ -653,7 +653,7 @@ async def resolve_turn_route(
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
-    except Exception as exc:  # noqa: BLE001 — a router outage must never block a turn
+    except Exception as exc:  # a router outage must never block a turn
         _logger.warning(
             "route-turn: router call failed for session=%s; allowing unrouted",
             session_id,
@@ -846,7 +846,7 @@ def _handler_factory(
                     _awaited(resolver(session_id, req)), loop
                 )
                 decision = future.result(timeout=request_timeout_s)
-            except Exception:  # noqa: BLE001 — never wedge a user's prompt
+            except Exception:  # never wedge a user's prompt
                 _logger.warning(
                     "route-turn: resolver failed for session=%s", session_id, exc_info=True
                 )
@@ -921,7 +921,7 @@ def make_server_relay_resolver(
             )
             resp.raise_for_status()
             payload = resp.json()
-        except Exception:  # noqa: BLE001 — server hop failures are expected
+        except Exception:  # server hop failures are expected
             _logger.warning(
                 "route-turn: server relay failed for session=%s", session_id, exc_info=True
             )
@@ -1373,7 +1373,7 @@ async def _prompt_already_ran(session_id: str, prompt: str, server_client: Any) 
         )
         resp.raise_for_status()
         payload = resp.json()
-    except Exception:  # noqa: BLE001 — an unreadable session is "unknown"
+    except Exception:  # an unreadable session is "unknown"
         _logger.debug("route-turn: item scan failed for session=%s", session_id, exc_info=True)
         return None
     if not isinstance(payload, dict):
@@ -1431,6 +1431,7 @@ async def _apply_routed_model(
         inject_slash_command,
         read_claude_status_model,
         read_model_env,
+        read_model_picker_values,
     )
     from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
@@ -1446,14 +1447,16 @@ async def _apply_routed_model(
         )
         return True
     env = read_model_env(bridge_dir) or None
-    arg = claude_model_command_arg(model, env)
+    picker_values = read_model_picker_values(bridge_dir)
+    arg = claude_model_command_arg(model, env, picker_values=picker_values)
     if arg is None:
         _logger.warning(
-            "route-turn: routed model %r has no spelling session=%s accepts (pins=%s); "
-            "replaying on the launch model",
+            "route-turn: routed model %r has no spelling session=%s accepts "
+            "(pins=%s, picker=%s); replaying on the launch model",
             model,
             session_id,
             sorted(env or ()),
+            picker_values,
         )
         return False
     try:

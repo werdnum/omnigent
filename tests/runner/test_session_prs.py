@@ -7,9 +7,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
-from omnigent.runner.pr_observer import extract_prs, observe_hook
+from omnigent.runner import pr_observer
+from omnigent.runner.pr_observer import _shell_segments, extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -371,6 +374,17 @@ def test_creation_metadata_preserves_other_write_identities() -> None:
     assert created
 
 
+def test_single_creation_ignores_other_printed_prs() -> None:
+    """A printed old PR URL stays out until the deferred lookup verifies it."""
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"printf '%s\\n' {A} && gh pr create --fill"},
+        {"stdout": f"{A}\n{B}\n", "gitOperation": {"pr": {"url": B, "action": "created"}}},
+    )
+    assert [ref.url for ref in refs] == [B]
+    assert created
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -392,6 +406,37 @@ def test_creation_metadata_preserves_other_write_identities() -> None:
 def test_pr_changes_still_use_command_targets(command: str) -> None:
     refs, created = extract_prs("Bash", {"command": command}, "Done.")
     assert [ref.url for ref in refs] == [A]
+    assert not created
+
+
+@pytest.mark.parametrize("redirection", ["2>errors.log", "2>>errors.log", "2>&1", "3<input.txt"])
+@pytest.mark.parametrize("target", ["", "2", "42"])
+def test_shell_redirection_descriptors_are_not_pr_targets(redirection: str, target: str) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": f"gh pr merge {target} -R example/one --squash {redirection}"},
+        {"exit_code": 0, "stdout": "Done."},
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
+    assert not created
+
+
+@pytest.mark.parametrize(
+    "command,target",
+    [
+        ("gh pr ready -R example/one 2>&1", None),
+        ("gh pr edit -R example/one 2 >out", "2"),
+    ],
+)
+def test_shell_redirections_preserve_positional_arguments(
+    command: str, target: str | None
+) -> None:
+    refs, created = extract_prs(
+        "Bash", {"command": command}, {"exit_code": 0, "stdout": "Updated"}
+    )
+    expected = [f"https://github.com/example/one/pull/{target}"] if target else []
+    assert [ref.url for ref in refs] == expected
     assert not created
 
 
@@ -479,7 +524,181 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert [entry.url for entry in store.list()] == [A]
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+def test_associations_stay_unreported_until_acknowledged(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test")
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [A]
+    # A change recorded while that report was in flight survives its acknowledgement.
+    store.record([PullRequestRef.from_url(B)], relationship="worked_on", source="test")
+    store.mark_reported(revision, [A])
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [B]
+    store.mark_reported(revision, [B])
+    assert store.pending_reports()[1] == []
+    store.record([PullRequestRef.from_url(A)], relationship="worked_on", source="test")
+    store.remove(A)
+    assert store.pending_reports()[1] == []
+
+
+def test_files_from_before_reporting_are_reported_once(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test")
+    legacy = json.loads(store.path.read_text())
+    del legacy["unreported"], legacy["revision"]
+    store.path.write_text(json.dumps(legacy))
+    revision, pending = store.pending_reports()
+    assert [entry.url for entry in pending] == [A]
+    store.mark_reported(revision, [A])
+    assert store.pending_reports()[1] == []
+
+
+@pytest.mark.parametrize(
+    "cached_title",
+    [{}, {"title": "Last known title", "title_checked_at": 20}],
+)
+def test_title_cache_is_backward_compatible(
+    tmp_path: Path, cached_title: dict[str, object]
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prs": [
+                    {
+                        **PullRequestRef.from_url(A).model_dump(),
+                        "relationship": "created",
+                        "source": "test",
+                        "first_seen_at": 10,
+                        "last_seen_at": 10,
+                        **cached_title,
+                    }
+                ],
+            }
+        )
+    )
+    entry = store.list()[0]
+    assert entry.title == cached_title.get("title")
+    assert entry.title_checked_at == cached_title.get("title_checked_at", 0)
+    assert entry.title_lookup_timed_out is False
+
+
+def test_title_cache_preserves_order_and_survives_new_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    store.update_titles({A: "First", B: "Second"}, timestamp=30)
+    assert [entry.url for entry in store.list()] == [B, A]
+    assert [entry.last_seen_at for entry in store.list()] == [20, 10]
+    store.record(
+        [PullRequestRef.from_url(A)], relationship="worked_on", source="test", timestamp=40
+    )
+    entry = store.list()[0]
+    assert entry.url == A
+    assert entry.title == "First"
+    assert entry.title_checked_at == 30
+    assert entry.first_seen_at == 10
+    assert entry.relationship == "created"
+
+
+def test_title_cache_preserves_newer_updates_and_removed_prs(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record(
+        [PullRequestRef.from_url(A), PullRequestRef.from_url(B)],
+        relationship="created",
+        source="test",
+    )
+    store.update_titles({A: "New title", B: "Second"}, timestamp=30)
+    store.remove(B)
+    store.update_titles({A: "Old title", B: "Removed title"}, timestamp=20)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    store.update_titles({A: None, B: "Removed title"}, timestamp=40)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    assert store.list()[0].title_checked_at == 40
+    store.record([PullRequestRef.from_url(B)], relationship="inferred", source="branch")
+    assert [entry.url for entry in store.list()] == [A]
+
+
+def test_title_timeout_preserves_cached_title_and_survives_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    reference = PullRequestRef.from_url(A)
+    store.record([reference], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    restored = SessionPrRegistry("conv_a", root=tmp_path)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+
+    restored.record([reference], relationship="worked_on", source="test", timestamp=40)
+    entry = restored.list()[0]
+    assert entry.title == "Last known title"
+    assert entry.title_checked_at == 30
+    assert entry.title_lookup_timed_out is True
+    assert entry.last_seen_at == 40
+
+
+@pytest.mark.parametrize(
+    "title,timed_out_urls,expected_title",
+    [
+        ("Fetched title", (), "Fetched title"),
+        (None, (), "Last known title"),
+        ("Fetched title", (A,), "Fetched title"),
+    ],
+)
+def test_completed_title_lookup_clears_timeout_marker(
+    tmp_path: Path, title: str | None, timed_out_urls: tuple[str, ...], expected_title: str
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: None}, timestamp=30, timed_out_urls={A})
+
+    store.update_titles({A: title}, timestamp=40, timed_out_urls=timed_out_urls)
+
+    entry = store.list()[0]
+    assert entry.title == expected_title
+    assert entry.title_checked_at == 40
+    assert entry.title_lookup_timed_out is False
+
+
+@pytest.mark.parametrize(
+    "newer_title,newer_timeouts,older_title,older_timeouts",
+    [
+        ("Newest title", (), None, (A,)),
+        (None, (A,), "Older title", ()),
+    ],
+)
+def test_title_cache_preserves_newer_timeout_marker(
+    tmp_path: Path,
+    newer_title: str | None,
+    newer_timeouts: tuple[str, ...],
+    older_title: str | None,
+    older_timeouts: tuple[str, ...],
+) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.update_titles({A: "Last known title"}, timestamp=20)
+    store.update_titles({A: newer_title}, timestamp=40, timed_out_urls=newer_timeouts)
+    latest = store.list()
+
+    store.update_titles({A: older_title}, timestamp=30, timed_out_urls=older_timeouts)
+
+    assert store.list() == latest
+
+
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Allow serialized durable writes to finish even on a busy CI filesystem.
+    monkeypatch.setattr(
+        "omnigent.runner.session_prs.FileLock",
+        lambda path, **_kwargs: FileLock(path, timeout=budget(10)),
+    )
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
@@ -490,7 +709,11 @@ def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(write, range(1, 17)))
-    assert len(SessionPrRegistry("conv_a", root=tmp_path).list()) == 16
+    prs = SessionPrRegistry("conv_a", root=tmp_path).list()
+    assert len(prs) == 16
+    assert {pr.url for pr in prs} == {
+        f"https://github.com/example/one/pull/{number}" for number in range(1, 17)
+    }
 
 
 def test_corruption_is_not_overwritten(tmp_path: Path) -> None:
@@ -538,6 +761,162 @@ def test_mixed_operations_do_not_claim_creation() -> None:
     refs, created = extract_prs("Bash", {"command": "gh pr create; gh pr edit 42"}, A)
     assert [ref.url for ref in refs] == [A]
     assert not created
+
+
+_CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"}}}
+
+
+@pytest.mark.parametrize(
+    "command,result,urls,created",
+    [
+        pytest.param(
+            "cd /worktree && GH_TOKEN=$(gh auth token --user example-user) gh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="unquoted-substitution-assignment",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<'EOF'\n## Summary\nWe don't wait (anymore.\ngh pr view 7\nEOF\n"
+            "gh pr create --title t --body-file /tmp/body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="heredoc-body-then-create",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<-EOF\n\tIt's done.\n\tEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="tab-stripped-heredoc",
+        ),
+        pytest.param(
+            "cat > notes.md <<'EOF'\ngh pr create\nEOF\ngh pr view 42",
+            A,
+            [],
+            False,
+            id="heredoc-body-is-not-run",
+        ),
+        pytest.param(
+            f'TOKEN=$(printf token # ) ; gh pr create\n)\nprintf "%s\\n" {A}',
+            {"stdout": A},
+            [],
+            False,
+            id="comment-inside-substitution",
+        ),
+        pytest.param(
+            f"cat <<EOF\nwe're not done\\\nEOF\ngh pr create\n{A}\nEOF",
+            {"stdout": A},
+            [],
+            False,
+            id="unquoted-heredoc-joins-continued-line",
+        ),
+        pytest.param(
+            "cat <<'EOF'\nwe're not done\\\nEOF\ngh pr create",
+            {"stdout": A},
+            [A],
+            True,
+            id="quoted-heredoc-keeps-continued-line",
+        ),
+        pytest.param(
+            # Read as a heredoc, ``shift`` would close a body holding the create.
+            "(( count = 8 << shift ))\ngh pr create --title t\nshift",
+            {"stdout": A},
+            [A],
+            True,
+            id="arithmetic-shift",
+        ),
+        pytest.param(
+            # Read as a heredoc, the closing ``EOF`` would swallow the create.
+            ": ${BODY:-<<EOF }\ngh pr create --title t\nEOF",
+            {"stdout": A},
+            [A],
+            True,
+            id="heredoc-text-in-parameter-expansion",
+        ),
+        pytest.param(
+            "cat <<\\\nEOF\ngh pr view 7\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-heredoc-delimiter",
+        ),
+        pytest.param(
+            "cat <<\\\n-EOF\n\tgh pr view 7\n\tEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-tab-stripping-operator",
+        ),
+        pytest.param(
+            "cat <<EOF\r\ngh pr create\r\nEOF\r\ngh pr view 7",
+            {"stdout": A},
+            [],
+            False,
+            id="crlf-heredoc",
+        ),
+        pytest.param(
+            "cat <<'EOF' # PR body\ntext\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="comment-after-heredoc-operator",
+        ),
+        pytest.param(
+            "cat > body.md <<'EOF' # PR body\ntext\nEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="comment-after-heredoc-operator-with-metadata",
+        ),
+        pytest.param(
+            # Escapes in a delimiter are not modelled, so the command is lexed as before.
+            'cat <<"E\\$OF"\nbody\nE$OF\ngh pr create --title t',
+            {"stdout": A},
+            [A],
+            True,
+            id="unsupported-delimiter-uses-plain-lexing",
+        ),
+    ],
+)
+def test_create_beside_substitution_and_heredoc(
+    command: str, result: object, urls: list[str], created: bool
+) -> None:
+    refs, was_created = extract_prs("Bash", {"command": command}, result)
+    assert [ref.url for ref in refs] == urls
+    assert was_created is created
+
+
+def test_unquoted_substitution_stays_one_exact_token() -> None:
+    segments = _shell_segments("GH_TOKEN=$(gh auth token --user me) gh pr create")
+    assert [segment.raw_tokens for segment in segments] == [
+        ("GH_TOKEN=$(gh auth token --user me)", "gh", "pr", "create")
+    ]
+
+
+def test_heredoc_operator_reads_a_bounded_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: list[int] = []
+
+    class CountingSlices(str):
+        def __getitem__(self, key: object) -> str:
+            text = str.__getitem__(self, key)  # type: ignore[call-overload]
+            scanned.append(len(text))
+            return text
+
+    calls: list[int] = []
+    original = pr_observer._heredoc_operator_text
+
+    def counting(command: str, start: int) -> tuple[str, bool]:
+        calls.append(start)
+        return original(CountingSlices(command), start)
+
+    monkeypatch.setattr(pr_observer, "_heredoc_operator_text", counting)
+    operators = 500
+    # Continuations between operators would make an unbounded reader rescan the line.
+    _shell_segments("cat " + ("<<A " + "\\\n" * 50) * operators + "\n")
+    assert 0 < len(calls) <= operators
+    assert sum(scanned) <= pr_observer._HEREDOC_OPERATOR_LIMIT * len(calls)
 
 
 @pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])
@@ -873,10 +1252,27 @@ def test_gh_subcommand_and_host(command: str, urls: list[str]) -> None:
 
 
 @pytest.mark.parametrize(
-    "result", [{"backgroundTaskId": "job-1"}, {"status": "running"}, {"interrupted": True}]
+    "result,graphql",
+    [
+        ({"backgroundTaskId": "job-1"}, False),
+        ({"status": "running"}, False),
+        ({"interrupted": True}, False),
+        ({"exit_code": 1}, False),
+        ({"exit_code": None, "session_id": "still-running"}, False),
+        ({"exit_code": 1}, True),
+    ],
 )
-def test_background_or_interrupted_shell_does_not_attach_target(result: dict) -> None:
-    refs, _ = extract_prs("Bash", {"command": f"gh pr edit {A} --title new"}, result)
+def test_unsuccessful_shell_does_not_attach_target(result: dict, graphql: bool) -> None:
+    command, output = (
+        (
+            "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+            "{ pullRequest { url } } }'",
+            json.dumps({"data": {"createPullRequest": {"pullRequest": {"url": A}}}}),
+        )
+        if graphql
+        else (f"gh pr edit {A} --title new", A)
+    )
+    refs, _ = extract_prs("exec_command", {"cmd": command}, {**result, "stdout": output})
     assert refs == []
 
 
@@ -897,6 +1293,7 @@ def test_background_or_interrupted_shell_does_not_attach_target(result: dict) ->
             True,
         ),
         (["gh api repos/example/one/pulls -X POST", "gh pr create"], [A, B], True),
+        (["gh api repos/example/one/pulls -X POST --jq .body", "gh pr create"], [], True),
     ],
 )
 @pytest.mark.parametrize("reverse", [False, True])
@@ -909,6 +1306,66 @@ def test_combined_operations_keep_prs_without_misattributing_creation(
         A + "\n" + B,
     )
     assert {ref.url for ref in refs} == set(urls)
+    assert was_created is created
+
+
+def test_gitlab_identity_jq_compound_output_remains_unattributed() -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {
+            "command": "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .web_url; gh pr create"
+        },
+        "https://gitlab.com/example/one/-/merge_requests/7\n" + A,
+    )
+    assert refs == []
+    assert created
+
+
+@pytest.mark.parametrize(
+    "content_command,target,created",
+    [
+        (
+            "glab api projects/example%2Fone/merge_requests -X POST "
+            "--hostname gitlab.com --jq .description",
+            None,
+            True,
+        ),
+        (
+            "glab api projects/example%2Fone/merge_requests/7 -X PUT "
+            "--hostname gitlab.com --jq .description",
+            "https://gitlab.com/example/one/-/merge_requests/7",
+            False,
+        ),
+        (
+            "az repos pr create --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            None,
+            True,
+        ),
+        (
+            "az repos pr update --id 7 --org https://dev.azure.com/example "
+            "-p project -r repo --query description",
+            "https://dev.azure.com/example/project/_git/repo/pullrequest/7",
+            False,
+        ),
+    ],
+)
+@pytest.mark.parametrize("reverse", [False, True])
+def test_graphql_with_other_providers_content_preserves_only_explicit_targets(
+    content_command: str, target: str | None, created: bool, reverse: bool
+) -> None:
+    graphql = (
+        "gh api graphql -f 'query=mutation { createPullRequest(input: {}) "
+        "{ pullRequest { url } } }' --jq .data.createPullRequest.pullRequest.url"
+    )
+    commands = [graphql, content_command]
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "; ".join(reversed(commands) if reverse else commands)},
+        A + "\n" + B,
+    )
+    assert [ref.url for ref in refs] == ([target] if target else [])
     assert was_created is created
 
 

@@ -16,6 +16,7 @@ import pytest
 from omnigent.onboarding.sandboxes import microsandbox as msmod
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
+    SandboxGoneError,
     host_image_wheel_install_command,
 )
 from omnigent.onboarding.sandboxes.microsandbox import (
@@ -23,6 +24,7 @@ from omnigent.onboarding.sandboxes.microsandbox import (
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     MicrosandboxSandboxLauncher,
 )
+from tests._helpers.live_server import find_free_port
 
 # Fakes mirror the optional async SDK without requiring a virtualization host.
 # Explicit recorders catch invalid access, and sys.modules resolves local imports.
@@ -375,6 +377,7 @@ class _FakeMicrosandboxState:
     removed: list[str] = field(default_factory=list)
     remove_attempts: list[str] = field(default_factory=list)
     create_raises: Exception | None = None
+    start_raises: Exception | None = None
     remove_raises: Exception | None = None
     create_hangs: bool = False  # if True, create() sleeps (to exercise cancellation)
     cancelled: bool = False  # set when a hung create coroutine is cancelled
@@ -410,6 +413,8 @@ def _install_fake_microsandbox(monkeypatch: pytest.MonkeyPatch) -> _FakeMicrosan
 
         @staticmethod
         async def start(name: str, *, detached: bool = False) -> _FakeSandbox:
+            if state.start_raises is not None:
+                raise state.start_raises
             state.start_calls.append(name)
             sandbox = state.sandboxes[name]
             sandbox.status = _FakeSandboxStatus.RUNNING
@@ -1032,8 +1037,21 @@ def test_resume_running_sandbox_is_noop(fake_microsandbox: _FakeMicrosandboxStat
 
 def test_resume_missing_sandbox_fails(fake_microsandbox: _FakeMicrosandboxState) -> None:
     """Resume of a removed sandbox is an error (the wake path relaunches instead)."""
-    with pytest.raises(click.ClickException, match="ms-gone"):
+    with pytest.raises(SandboxGoneError, match="ms-gone"):
         MicrosandboxSandboxLauncher().resume("ms-gone")
+
+
+def test_resume_deleted_during_start_raises_gone(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """Deletion racing the restart is still classified as definitive loss."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    fake_microsandbox.sandboxes[sandbox_id].status = _FakeSandboxStatus.STOPPED
+    fake_microsandbox.start_raises = _FakeSandboxNotFoundError("gone during start")
+
+    with pytest.raises(SandboxGoneError, match=sandbox_id):
+        launcher.resume(sandbox_id)
 
 
 def test_is_running_reports_status(fake_microsandbox: _FakeMicrosandboxState) -> None:
@@ -1096,13 +1114,6 @@ def test_attach_missing_sandbox_fails_with_create_hint(
 # ── forward_local_port ──────────────────────────────────────
 
 
-def _free_port() -> int:
-    """Grab an ephemeral local port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def test_forward_local_port_bridges_host_connection_into_guest(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
@@ -1116,7 +1127,7 @@ def test_forward_local_port_bridges_host_connection_into_guest(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
@@ -1181,7 +1192,7 @@ def test_forward_local_port_teardown_kills_live_bridges(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         conn = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -1212,7 +1223,7 @@ def test_forward_local_port_works_under_public_only(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:

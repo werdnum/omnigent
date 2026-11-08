@@ -11,11 +11,18 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 import omnigent.server.routes._sessions.helpers as helpers
 from omnigent.debug_logging import _attributes
+from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.server.failed_status_diagnostics import (
+    bound_runner_connection,
+    failed_status_intake_attributes,
+)
 from omnigent.server.schemas import ErrorDetail
 
 # Statuses that are not failures. Anything else a publish site can pass —
@@ -102,7 +109,7 @@ def test_detail_less_failure_still_reports_origin(
     # No turn to name; the sink drops null attributes rather than shipping
     # an empty column.
     assert record.attributes["response_id"] is None
-    assert "response_id" not in _attributes(record)
+    assert "response_id" not in _attributes(record, source="server")
 
 
 def test_unattributed_failure_is_labelled_not_blank(
@@ -137,6 +144,75 @@ def _failure_publish_calls(source: str) -> list[ast.Call]:
     return calls
 
 
+def test_oversized_failure_detail_is_capped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Oversized fallback text is bounded and reports its omitted length."""
+    reply = "Synthetic failure detail\n\n" + "detail " * 2000
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="native_turn_error", message=reply),
+        origin="external_session_status",
+    )
+    message = record.getMessage()
+    assert "code=native_turn_error" in message
+    detail = message.split("): ", 1)[1]
+    assert len(detail) < 4700, detail
+    assert detail.startswith("Synthetic failure detail")
+    assert "chars)" in detail
+
+
+def test_multiline_failure_detail_keeps_its_line_structure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A multiline error within the limit retains its diagnostic structure."""
+    trace = 'API Error: 400 {\n  "error": {\n    "code": 400,\n    "message": "bad"\n  }\n}'
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="native_turn_error", message=trace),
+        origin="external_session_status",
+    )
+    assert record.getMessage().endswith(trace)
+
+
+def test_runner_exit_reason_keeps_its_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner-exit reason retains its exit code, log path, and traceback."""
+    reason = (
+        "runner process exited with code 1 "
+        "(log on host: ~/.omnigent/logs/runner/runner-abc123-def456-7-8.log)\n"
+        + "\n".join(f"traceback line {n}" for n in range(120))
+    )
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="runner_exited", message=reason),
+        origin="runner_exited",
+    )
+    message = record.getMessage()
+    assert "runner process exited with code 1" in message
+    assert "~/.omnigent/logs/runner/runner-abc123-def456-7-8.log" in message
+    assert "traceback line 100" in message, "the log tail was clipped too aggressively"
+    # The tail's own line structure is what makes it readable.
+    assert "traceback line 0\ntraceback line 1" in message
+
+
+def test_short_failure_detail_is_preserved_verbatim(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Truncation must not touch the ordinary one-line reason."""
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(
+            source="execution",
+            code="native_terminal_ensure_failed",
+            message="Native Codex terminal failed to start",
+        ),
+        origin="native_terminal_boot_failed",
+    )
+    assert record.getMessage().endswith(": Native Codex terminal failed to start")
+
+
 def test_every_failure_publish_site_names_itself() -> None:
     """A new failure path cannot silently rejoin the undifferentiated bucket.
 
@@ -161,3 +237,75 @@ def test_every_failure_publish_site_names_itself() -> None:
             )
     # A scan that silently matched nothing would pass forever.
     assert checked >= 7, f"expected the known failure publish sites, found {checked}"
+
+
+@pytest.mark.parametrize(
+    ("data", "field", "state"),
+    [
+        ({}, "error", "missing"),
+        ({"error": None}, "error", "null"),
+        ({"error": []}, "error", "invalid"),
+        ({"error": {}}, "error", "empty"),
+        ({"error": {"code": 42}}, "code", "invalid"),
+        ({"error": {"message": "  "}}, "message", "empty"),
+        ({"output": "private-synthetic-token"}, "output", "present"),
+        ({"failure_detail": "https://example.test/private"}, "detail", "present"),
+        ({"failure_context": {}}, "context", "empty"),
+        ({"failure_context": {"native_hook_event": "StopFailure"}}, "context", "present"),
+    ],
+)
+def test_failed_status_intake_records_availability_without_content(
+    data: dict[str, object], field: str, state: str
+) -> None:
+    attributes = failed_status_intake_attributes(
+        data, runner_id="runner_one", connection=None, source="relay_stream"
+    )
+    assert attributes[f"failure_wire_{field}"] == state
+    assert attributes["failure_connection_state"] == "unavailable"
+    assert "private-synthetic-token" not in str(attributes)
+    assert "example.test" not in str(attributes)
+    assert "StopFailure" not in str(attributes)
+
+
+@pytest.mark.asyncio
+async def test_bound_runner_observation_is_explicit_and_ignores_replacement_identity() -> None:
+    registry = TunnelRegistry()
+    observed = registry.register(
+        "runner_one",
+        Mock(),
+        HelloFrame(runner_version="0.20.0", frame_protocol_version=1, connection_id="conn_old"),
+    )
+    assert bound_runner_connection(registry, "runner_one") is observed
+    replacement = registry.register(
+        "runner_one",
+        Mock(),
+        HelloFrame(runner_version="0.21.0", frame_protocol_version=1, connection_id="conn_new"),
+    )
+    attributes = failed_status_intake_attributes(
+        {}, runner_id="runner_one", connection=observed, source="bound_runner_at_intake"
+    )
+    assert attributes["failure_connection_source"] == "bound_runner_at_intake"
+    assert attributes["failure_runner_version"] == "0.20.0"
+    assert attributes["failure_connection_id"] == "conn_old"
+    assert attributes["failure_connection_generation"] == str(observed.generation)
+    assert observed.generation != replacement.generation
+    assert bound_runner_connection(registry, "missing") is None
+    assert bound_runner_connection(None, "runner_one") is None
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        {"runner_id": "another_runner", "runner_version": "0.20.0"},
+        {"runner_id": "runner_one", "runner_version": "https://example.test/private"},
+    ],
+)
+def test_failed_status_intake_rejects_mismatched_or_unsafe_connection_fields(
+    connection: dict[str, object],
+) -> None:
+    attributes = failed_status_intake_attributes(
+        {}, runner_id="runner_one", connection=connection, source="relay_stream"
+    )
+    assert "failure_runner_version" not in attributes
+    assert "another_runner" not in str(attributes)
+    assert "example.test" not in str(attributes)

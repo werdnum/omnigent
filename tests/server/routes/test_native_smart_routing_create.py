@@ -37,6 +37,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _installed_native_harnesses,
+    _no_native_candidate_error,
     _pre_session_model_catalog,
 )
 from omnigent.server.smart_routing import (
@@ -88,8 +89,8 @@ def _restore_runtime_globals() -> Iterator[None]:
         setattr(_globals, name, value)
 
 
-CLAUDE_MODEL = "databricks-claude-opus-4-8"
-GPT_MODEL = "databricks-gpt-5-5"
+CLAUDE_MODEL = "system.ai.claude-opus-4-8"
+GPT_MODEL = "system.ai.gpt-5-5"
 ROUTING_MESSAGE = "refactor the auth module and add tests"
 
 SPAWN_PAYLOAD = {
@@ -1036,6 +1037,7 @@ def _host(
         (_host({"claude-native": True, "codex-native": "binary-missing"}), ["claude-native"]),
         (_host({"claude-native": "needs-auth", "codex-native": True}), ["codex-native"]),
         (_host({"claude-native": "version-too-low", "codex-native": False}), []),
+        (_host({"claude-native": "tmux-unavailable", "codex-native": True}), ["codex-native"]),
         # An unreported harness can't be assumed installed.
         (_host({"claude-native": True}), ["claude-native"]),
         # Fails open: a host with no readiness map doesn't disable routing.
@@ -1048,6 +1050,35 @@ def test_installed_native_harnesses_follows_host_readiness(
     host: Host | None, expected: list[str]
 ) -> None:
     assert _installed_native_harnesses(host) == expected
+
+
+_NO_NATIVE_CLI = "No native CLI is installed on this host."
+_TMUX_REMEDY = (
+    "Native CLIs on this host need tmux 3.3 or newer. "
+    "Install or upgrade tmux on the host, then check the harness again."
+)
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        (
+            _host({"claude-native": "tmux-unavailable", "codex-native": "tmux-unavailable"}),
+            _TMUX_REMEDY,
+        ),
+        # The installed CLI is blocked by tmux, so tmux is still the remedy.
+        (
+            _host({"claude-native": "tmux-unavailable", "codex-native": "binary-missing"}),
+            _TMUX_REMEDY,
+        ),
+        (_host({"claude-native": "binary-missing", "codex-native": False}), _NO_NATIVE_CLI),
+        (None, _NO_NATIVE_CLI),
+    ],
+)
+def test_no_native_candidate_error_names_tmux_when_it_is_the_blocker(
+    host: Host | None, expected: str
+) -> None:
+    assert _no_native_candidate_error(host) == expected
 
 
 # ── Credential-provider gating ──────────────────────────────────────────────
@@ -1142,7 +1173,7 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     [
         ({"claude-native": True, "codex-native": False}, "Codex"),
         ({"claude-native": False, "codex-native": True}, "Claude"),
-        # No AI Gateway anywhere: both arms are named.
+        # No Unity Gateway anywhere: both arms are named.
         ({"claude-native": False, "codex-native": False}, "Claude and Codex"),
     ],
 )
@@ -1542,8 +1573,8 @@ async def test_sdk_harness_create_is_not_gated_by_native_gateway_state(
 # current arms must be servable candidates — an arm missing from the candidate
 # set is substituted down a generation (a routed gpt-5-6-sol applying 5-5).
 
-SOL = "databricks-gpt-5-6-sol"
-LUNA = "databricks-gpt-5-6-luna"
+SOL = "system.ai.gpt-5-6-sol"
+LUNA = "system.ai.gpt-5-6-luna"
 HOST_GPT_CATALOG = [LUNA, SOL]
 
 
@@ -1622,8 +1653,8 @@ async def test_pre_session_catalog_is_offered_instead_of_the_static_table(
 @pytest.mark.parametrize(
     ("arm", "applied"),
     [
-        ("gpt-5-6-sol", "databricks-gpt-5-6-sol"),
-        ("gpt-5-6-luna", "databricks-gpt-5-6-luna"),
+        ("gpt-5-6-sol", "system.ai.gpt-5-6-sol"),
+        ("gpt-5-6-luna", "system.ai.gpt-5-6-luna"),
         # No discovery listing carries glm, so the static table is its only
         # source; it applies under the gateway's model-route spelling.
         ("glm-5-2", "system.ai.glm-5-2"),
@@ -1787,6 +1818,61 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
         _routed_turn_model_spelling("conv_vocab", conv, "databricks-gpt-5-5")
         == "databricks-gpt-5-5"
     )
+
+
+async def test_turn_catalog_uses_pi_native_pushed_registry() -> None:
+    """A pi-native pane routes within its own ``provider/id`` registry.
+
+    Pi's ``setModel`` resolves only what its extension pushed as
+    ``external_model_options``; a runner ``databricks-*`` catalog would route
+    the turn onto ids the pane cannot switch to.
+    """
+    from omnigent.harness_plugins import PI_NATIVE_CODING_AGENT
+    from omnigent.server.routes._sessions.orchestration import (
+        _native_turn_catalog,
+        _pushed_model_options_cache,
+    )
+
+    session_id = "conv_pi_vocab"
+    conv = SimpleNamespace(
+        id=session_id, labels={"omnigent.wrapper": PI_NATIVE_CODING_AGENT.wrapper_label}
+    )
+    assert await _native_turn_catalog(session_id, conv) is None
+    _pushed_model_options_cache[session_id] = [
+        {"id": "omnigent/databricks-claude-opus-4-8", "displayName": "Opus"},
+        {"id": "omnigent-openai/system.ai.gpt-5-4-mini", "displayName": "mini"},
+    ]
+    try:
+        assert await _native_turn_catalog(session_id, conv) == [
+            "omnigent/databricks-claude-opus-4-8",
+            "omnigent-openai/system.ai.gpt-5-4-mini",
+        ]
+    finally:
+        _pushed_model_options_cache.pop(session_id, None)
+
+
+async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_managed_vocab"
+    conv = _native_conv(session_id)
+    _model_options_cache[session_id] = [
+        {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3"},
+    ]
+    try:
+        assert "system.ai.glm-5-3" in await _native_turn_catalog(session_id, conv)
+        assert (
+            _routed_turn_model_spelling(session_id, conv, "system.ai.glm-5-3")
+            == "system.ai.glm-5-3"
+        )
+        assert _routed_turn_model_spelling(session_id, conv, "system.ai.kimi-k3") is None
+    finally:
+        _model_options_cache.pop(session_id, None)
 
 
 async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
@@ -2264,3 +2350,50 @@ async def test_a_routing_outage_still_creates_the_fixed_harness_session(
     assert len(decisions) == 1
     assert decisions[0]["applied"] is False
     assert decisions[0]["rationale"]
+
+
+def test_routed_spelling_types_a_managed_picker_row_verbatim() -> None:
+    """A routed model of no Claude family is spelled by the pane's picker row.
+
+    A workspace-managed picker lists every served model by its own id, which
+    ``/model`` takes verbatim. Alias pins spell none of them, so the router's
+    pick was recorded as "not applied" and the pane kept its launch model.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.server.routes._sessions import orchestration as _orchestration
+
+    conv = Conversation(
+        id="conv_managed",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_managed",
+        agent_id="agent_managed",
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    rows = [
+        {"id": "system.ai.claude-opus-4-8[1m]", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3"},
+    ]
+    _orchestration._model_options_cache["conv_managed"] = rows
+    try:
+        assert (
+            _orchestration._routed_turn_model_spelling("conv_managed", conv, "system.ai.glm-5-3")
+            == "system.ai.glm-5-3"
+        )
+        # The picker's exact row wins over the family alias its pin would
+        # otherwise step onto.
+        assert (
+            _orchestration._routed_turn_model_spelling(
+                "conv_managed", conv, "databricks-claude-opus-4-8"
+            )
+            == "system.ai.claude-opus-4-8[1m]"
+        )
+        # A model no row spells still passes through untranslated: rows that
+        # restate their own id pin nothing, and the pane's launch env stays
+        # the authority on what it can switch to.
+        assert (
+            _orchestration._routed_turn_model_spelling("conv_managed", conv, "system.ai.kimi-k3")
+            == "system.ai.kimi-k3"
+        )
+    finally:
+        _orchestration._model_options_cache.pop("conv_managed", None)

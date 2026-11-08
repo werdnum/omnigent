@@ -1,20 +1,22 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 /**
  * TanStack Query hooks for session permissions CRUD.
  * Wraps the fetch functions in `permissionsApi.ts`.
  */
 
 import { useMemo } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { PINNED_CONVERSATIONS_KEY } from "@/hooks/useConversations";
 import {
   type Permission,
   derivePermissionLevel,
   getSessionOwner,
   grantPermission,
+  isOwnerLevel,
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { useConversations } from "./useConversations";
 import { useSession } from "./useSession";
 
 function permissionsKey(sessionId: string) {
@@ -53,26 +55,33 @@ export function useSessionOwner(sessionId: string | null) {
   });
 }
 
-/** Grant or update a permission. Invalidates the permissions list on success. */
+/**
+ * Mark the grants and every session list stale after a share change, so active
+ * lists refetch and pick up the server's `shared_with_others`.
+ */
+function invalidateAfterShareChange(qc: QueryClient, sessionId: string): void {
+  void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
+  void qc.invalidateQueries({ queryKey: ["conversations"] });
+  void qc.invalidateQueries({ queryKey: ["project-sessions"] });
+  void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+}
+
+/** Grant or update a permission. Invalidates the grants and session lists on success. */
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ userId, level }: { userId: string; level: number }) =>
       grantPermission(sessionId, userId, level),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
   });
 }
 
-/** Revoke a permission. Invalidates the permissions list on success. */
+/** Revoke a permission. Invalidates the grants and session lists on success. */
 export function useRevokePermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) => revokePermission(sessionId, userId),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
-    },
+    onSuccess: () => invalidateAfterShareChange(qc, sessionId),
   });
 }
 
@@ -81,7 +90,7 @@ export function useRevokePermission(sessionId: string) {
  * `null` permission level (single-user mode) is treated as unrestricted.
  */
 export function useCanEdit(conversationId: string): boolean {
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
@@ -95,6 +104,19 @@ export function useCanEdit(conversationId: string): boolean {
     );
     return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Whether the viewer can start side chats in a session: only the owner of its
+ * root can. Uses the server's answer, falling back to the viewer's permission
+ * level for servers that don't send one.
+ */
+export function useCanStartSideChat(
+  sessionId: string | null | undefined,
+  permissionLevel: number | null,
+): boolean {
+  const { session, isLoading } = useSession(sessionId);
+  return session?.sideChatAllowed ?? (!isLoading && isOwnerLevel(permissionLevel));
 }
 
 export type { Permission };
