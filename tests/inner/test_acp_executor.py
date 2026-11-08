@@ -884,6 +884,14 @@ def test_claimed_completion_frame_emits_no_spurious_parent_card() -> None:
             },
             True,
         ),
+        (
+            {
+                "name": "mcp_omnigent_sys_session_get_info",
+                "title": "Run mcp_omnigent_sys_session_get_info",
+                "rawInput": {"toolSummary": "Get session info"},
+            },
+            True,
+        ),
         ({"title": "GitHub comments", "rawInput": {"tool": "github__list_comments"}}, False),
         ({"title": "shell: git status", "rawInput": {"command": "git status"}}, False),
     ],
