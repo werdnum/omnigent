@@ -87,6 +87,23 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
+    # Antigravity CLI (Google's ``agy`` CLI) drives ``agy acp``. Ships via a
+    # shell installer (not npm) and authenticates through its own interactive
+    # browser sign-in (``agy``) or ``GEMINI_API_KEY``; Omnigent stores no
+    # credential for the ACP row.
+    "antigravity-acp": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Antigravity ACP",
+            "agy",
+            None,
+            login_args=(),
+            status_args=("models",),
+            install_hint="curl -fsSL https://antigravity.google/cli/install.sh | bash",
+            auth_hint="run `agy` and complete the browser sign-in, or set GEMINI_API_KEY",
+        ),
+        args=("acp",),
+        aliases=("agy-acp",),
+    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no

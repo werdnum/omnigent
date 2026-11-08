@@ -1492,6 +1492,7 @@ class AcpExecutor(Executor):
         """
         if not self._bridge_tool_aliases:
             return False
+        update_name = str(update.get("name", "")) if isinstance(update.get("name"), str) else ""
         raw = update.get("rawInput")
         raw_tool = str(raw.get("tool", "")) if isinstance(raw, dict) else ""
         # Goose reports the machine name under ``_meta.goose.toolCall.toolName``;
@@ -1505,7 +1506,7 @@ class AcpExecutor(Executor):
                 (inner.get("toolName", "") if isinstance(inner, dict) else "")
                 or goose.get("toolName", "")
             )
-        candidates = {c for c in (name, raw_tool, meta_tool) if c}
+        candidates = {c for c in (name, update_name, raw_tool, meta_tool) if c}
         return not self._bridge_tool_aliases.isdisjoint(candidates)
 
     def _reset_session_state(self) -> None:
